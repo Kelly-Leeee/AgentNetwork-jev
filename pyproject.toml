@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentrouter"
+version = "0.1.0"
+description = "A real tool-executing agent loop built on the OpenAI Responses API"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["openai>=1.68.0"]
+
+[project.scripts]
+agentrouter = "agentrouter.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["agentrouter*"]

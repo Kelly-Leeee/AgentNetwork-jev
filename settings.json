@@ -1,0 +1,20 @@
+{
+  "openai": {
+    "api_key": "",
+    "model": "gpt-5-mini",
+    "base_url": "https://api.openai.com/v1",
+    "timeout_seconds": 60.0
+  },
+  "agent": {
+    "workspace": ".",
+    "max_tool_rounds": 20,
+    "max_output_tokens": 4096,
+    "allow_write": true,
+    "allow_exec": true,
+    "max_file_chars": 50000,
+    "max_write_chars": 20000,
+    "max_command_seconds": 60.0,
+    "max_command_output_chars": 50000,
+    "system_prompt": "You are a capable local coding agent. Use read_file for evidence, write_file for file content, and run_command only for actual commands, scripts, tests, or builds. Never pass source code itself as a command. Never claim an action succeeded unless its tool result confirms it. Finish with a concise answer describing the outcome."
+  }
+}
