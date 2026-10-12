@@ -60,8 +60,8 @@ Requirements: Python 3.10+, an OpenAI-compatible API key, and a JEV API key.
 ### 1. Clone
 
 ```bash
-git clone https://github.com/Kelly-Leeee/agentrouter.git
-cd agentrouter
+git clone https://github.com/Kelly-Leeee/AgentNetwork-jev.git
+cd AgentNetwork-jev
 ```
 
 ### 2. Add API keys
