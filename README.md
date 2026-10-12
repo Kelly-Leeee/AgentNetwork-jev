@@ -21,7 +21,7 @@ This repository demonstrates:
 
 ## Quickstart
 
-Requirements: Python 3.10+, an OpenAI-compatible API key, and a JEV API key. Node.js is not required.
+Requirements: Python 3.10+, an OpenAI-compatible API key, and a JEV API key.
 
 ### 1. Clone
 
