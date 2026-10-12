@@ -16,6 +16,7 @@ This repository demonstrates:
 - parallel agent orchestration
 - role-free and role-optional agent teams
 - dynamic idle-agent selection
+- editable demo tasks and user-created workstreams
 - human-in-the-loop workflows
 - OpenAI Responses API agents with real tools
 
@@ -63,6 +64,6 @@ For a remote or headless machine:
 ./start.sh --no-open --host 0.0.0.0
 ```
 
-AgentRouter is an early research prototype. It currently ships with a demo workflow and supports up to three agents. Keep API keys in environment variables; never commit them.
+AgentNetwork is an early research prototype. It ships with two editable demo tasks, supports user-created tasks, and runs with up to five agents. Keep API keys in environment variables; never commit them.
 
 Apache-2.0 license.

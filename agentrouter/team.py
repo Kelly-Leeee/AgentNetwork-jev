@@ -30,11 +30,14 @@ RESCHEDULE_REQUEST = (
     "2:00 PM. I'm in Melbourne time. Please confirm once it is changed."
 )
 
-DEFAULT_AGENT_SPECS = [
-    ("agent-1", "Agent 1"),
-    ("agent-2", "Agent 2"),
-    ("agent-3", "Agent 3"),
-]
+MAX_AGENTS = 5
+MAX_TASKS = 10
+DEMO_TASK_IDS = {"support-recovery", "meeting-reschedule"}
+
+
+def agent_spec(index: int) -> tuple[str, str]:
+    number = index + 1
+    return f"agent-{number}", f"Agent {number}"
 
 
 class EventHub:
@@ -156,7 +159,8 @@ class TeamOrchestrator:
             ],
         }
         self._agents.clear()
-        for agent_id, name in DEFAULT_AGENT_SPECS[:2]:
+        for index in range(2):
+            agent_id, name = agent_spec(index)
             self._agents[agent_id] = self._make_agent(agent_id, name)
         self._event_log.clear()
         self._emit("task_ready", "system", {"message": "Demo task is ready"})
@@ -211,6 +215,7 @@ class TeamOrchestrator:
             return {
                 "task": deepcopy(self.task),
                 "agents": [agent.public() for agent in self._agents.values()],
+                "max_agents": MAX_AGENTS,
                 "events": deepcopy(self._event_log[-80:]),
                 "paused": self._paused,
                 "running": self._run_lock.locked(),
@@ -218,13 +223,80 @@ class TeamOrchestrator:
 
     def add_agent(self) -> dict[str, Any]:
         with self._state_lock:
-            if len(self._agents) >= 3:
-                raise ValueError("The canvas supports at most 3 agents")
-            spec = DEFAULT_AGENT_SPECS[len(self._agents)]
+            if len(self._agents) >= MAX_AGENTS:
+                raise ValueError(f"The canvas supports at most {MAX_AGENTS} agents")
+            spec = agent_spec(len(self._agents))
             agent = self._make_agent(*spec)
             self._agents[agent.id] = agent
             self._emit("agent_added", agent.id, {"name": agent.name})
             return agent.public()
+
+    def update_task(self, *, goal: str,
+                    workstreams: list[dict[str, str]]) -> dict[str, Any]:
+        if self._run_lock.locked():
+            raise RuntimeError("Cannot customize tasks while a step is running")
+        with self._state_lock:
+            if self.task["jev_call_count"] or any(agent.runs for agent in self._agents.values()):
+                raise RuntimeError("Reset the demo before customizing tasks after execution has started")
+            goal = goal.strip()
+            if not goal or len(goal) > 500:
+                raise ValueError("task goal must be between 1 and 500 characters")
+            if not 2 <= len(workstreams) <= MAX_TASKS:
+                raise ValueError(f"the network supports between 2 and {MAX_TASKS} tasks")
+            supplied_ids = {item.get("id") for item in workstreams}
+            if not DEMO_TASK_IDS.issubset(supplied_ids):
+                raise ValueError("the two demo tasks must be retained")
+            current = {item["id"]: item for item in self.task["workstreams"]}
+            previous_todos = self.task["todos"]
+            updated_workstreams: list[dict[str, Any]] = []
+            updated_todos: list[dict[str, Any]] = []
+            seen_ids: set[str] = set()
+            agent_ids = list(self._agents)
+            for index, update in enumerate(workstreams):
+                workstream_id = update.get("id", "")
+                if not workstream_id or workstream_id.startswith("new-"):
+                    workstream_id = f"custom-{uuid4().hex[:8]}"
+                if workstream_id in seen_ids:
+                    raise ValueError("each task must be provided exactly once")
+                seen_ids.add(workstream_id)
+                title = update.get("title", "").strip()
+                workstream_goal = update.get("goal", "").strip()
+                workstream_input = update.get("input", "").strip()
+                if not title or len(title) > 120:
+                    raise ValueError("task title must be between 1 and 120 characters")
+                if not workstream_goal or len(workstream_goal) > 500:
+                    raise ValueError("task goal must be between 1 and 500 characters")
+                if not workstream_input or len(workstream_input) > 8000:
+                    raise ValueError("task input must be between 1 and 8000 characters")
+                owner = current.get(workstream_id, {}).get("owner") or agent_ids[index % len(agent_ids)]
+                updated_workstreams.append({
+                    "id": workstream_id, "title": title, "goal": workstream_goal,
+                    "input": workstream_input, "owner": owner, "status": "ready",
+                    "final_output": "",
+                })
+                existing_todos = [item for item in previous_todos if item["workstream_id"] == workstream_id]
+                if existing_todos:
+                    updated_todos.extend(existing_todos)
+                else:
+                    for step, todo_title in enumerate((
+                        "Analyze the task and plan the work",
+                        "Produce a complete result",
+                        "Review and finalize the result",
+                    ), start=1):
+                        updated_todos.append({
+                            "id": f"{workstream_id}-{step}", "workstream_id": workstream_id,
+                            "step": step, "title": todo_title,
+                            "status": "assigned" if step == 1 else "pending",
+                            "owner": owner, "result": "", "agent_output": None,
+                        })
+            self.task["goal"] = goal
+            self.task["workstreams"] = updated_workstreams
+            self.task["todos"] = updated_todos
+            self.task["transcript"] = next(
+                item["input"] for item in updated_workstreams if item["id"] == "support-recovery"
+            )
+            self._emit("task_customized", "user", {"workstream_ids": list(seen_ids)})
+            return self.snapshot()
 
     def update_agent(self, agent_id: str, *, name: str,
                      role: str | None = None) -> dict[str, Any]:

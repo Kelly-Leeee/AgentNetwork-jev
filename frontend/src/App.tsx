@@ -5,15 +5,21 @@ import {
 } from '@xyflow/react';
 import { api } from './api';
 import { AgentNode, type AgentFlowNode } from './AgentNode';
-import type { AgentRun, CanvasState, RouteRun, Selection, TeamAgent, TeamEvent } from './types';
+import type { AgentRun, CanvasState, RouteRun, Selection, TeamAgent, TeamEvent, Workstream } from './types';
 
 const initialPositions: Record<string, { x: number; y: number }> = {
   jev: { x: 310, y: 50 },
-  'agent-1': { x: 70, y: 245 },
-  'agent-2': { x: 550, y: 245 },
-  'agent-3': { x: 790, y: 245 },
   'ask-user': { x: 310, y: 405 },
 };
+
+function initialPosition(id: string) {
+  const match = /^agent-(\d+)$/.exec(id);
+  const agentNumber = Number(match?.[1]);
+  if (Number.isInteger(agentNumber) && agentNumber >= 1) {
+    return { x: (agentNumber - 1) * 190, y: 245 };
+  }
+  return initialPositions[id] ?? { x: 300, y: 300 };
+}
 
 const nodeTypes = { agent: AgentNode };
 
@@ -21,7 +27,7 @@ export function App() {
   const [state, setState] = useState<CanvasState | null>(null);
   const [selection, setSelection] = useState<Selection>(null);
   const [error, setError] = useState('');
-  const [transcriptOpen, setTranscriptOpen] = useState(false);
+  const [taskEditorOpen, setTaskEditorOpen] = useState(false);
   const [nodes, setNodes, onNodesChange] = useNodesState<AgentFlowNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const flow = useRef<ReactFlowInstance<AgentFlowNode, Edge> | null>(null);
@@ -47,7 +53,7 @@ export function App() {
         const existing = previous.get(id);
         if (existing) return { ...existing, data };
         return {
-          id, type: 'agent', position: initialPositions[id] ?? { x: 300, y: 300 }, data,
+          id, type: 'agent', position: initialPosition(id), data,
         };
       };
       return [
@@ -122,14 +128,14 @@ export function App() {
       <div className={`workspace ${selection ? 'has-selection' : ''}`}>
         <aside className="left-panel panel">
           <p className="eyebrow">Parallel demo</p><h2>{state.task.goal}</h2>
-          <button className="link" onClick={() => setTranscriptOpen(value => !value)}>{transcriptOpen ? 'Hide' : 'View'} workstream inputs</button>
-          {transcriptOpen && state.task.workstreams.map(workstream => <blockquote key={workstream.id}><b>{workstream.title}</b><br />{workstream.input}</blockquote>)}
+          <button className="link" onClick={() => setTaskEditorOpen(value => !value)}>{taskEditorOpen ? 'Hide task editor' : 'Customize tasks'}</button>
+          {taskEditorOpen && <TaskEditor state={state} onSave={(goal, workstreams) => act(() => api.updateTask(goal, workstreams))} />}
           <div className="section-title"><span>Workstreams</span><span>{completed} / {state.task.todos.length} steps</span></div>
           {state.task.workstreams.map(workstream => <section className="workstream" key={workstream.id}>
             <div className="section-title"><span>{workstream.title}</span><span>{workstream.owner} · {workstream.status}</span></div>
             <div className="todos">{state.task.todos.filter(todo => todo.workstream_id === workstream.id).map(todo => <div className={`todo ${todo.status}`} key={todo.id}><i>{todo.status === 'completed' ? '✓' : todo.status === 'skipped' ? '–' : ''}</i><div><b>{todo.title}</b><small>Step {todo.step} · {todo.owner ?? 'Unassigned'} · {todo.status}</small></div></div>)}</div>
           </section>)}
-          <div className="add-agent"><button disabled={state.agents.length >= 3 || state.running} onClick={async () => { try { await api.addAgent(); await refresh(); } catch (cause) { setError(messageOf(cause)); } }}>{state.agents.length >= 3 ? '3 agents added' : '+ Add third agent'}</button><p>All agents are peer workers. Routing uses live status, not predefined roles.</p></div>
+          <div className="add-agent"><button disabled={state.agents.length >= state.max_agents || state.running} onClick={async () => { try { await api.addAgent(); await refresh(); } catch (cause) { setError(messageOf(cause)); } }}>{state.agents.length >= state.max_agents ? `${state.max_agents} agents added` : '+ Add agent'}</button><p>All agents are peer workers. Routing uses live status, not predefined roles.</p></div>
         </aside>
 
         <main className="center">
@@ -150,6 +156,51 @@ export function App() {
 }
 
 function Pill({ children }: { children: React.ReactNode }) { return <span className="pill">{children}</span>; }
+
+type EditableWorkstream = Pick<Workstream, 'id' | 'title' | 'goal' | 'input'>;
+
+function TaskEditor({ state, onSave }: {
+  state: CanvasState;
+  onSave: (goal: string, workstreams: EditableWorkstream[]) => Promise<void>;
+}) {
+  const [goal, setGoal] = useState(state.task.goal);
+  const [workstreams, setWorkstreams] = useState<EditableWorkstream[]>(() => editableWorkstreams(state));
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setGoal(state.task.goal);
+    setWorkstreams(editableWorkstreams(state));
+  }, [state.task.goal, state.task.workstreams]);
+
+  const update = (index: number, field: 'title' | 'goal' | 'input', value: string) => {
+    setWorkstreams(current => current.map((item, itemIndex) => itemIndex === index ? { ...item, [field]: value } : item));
+  };
+  const canEdit = !state.running && state.task.jev_call_count === 0 && state.agents.every(agent => agent.runs.length === 0);
+  const valid = Boolean(goal.trim()) && workstreams.every(item => item.title.trim() && item.goal.trim() && item.input.trim());
+
+  return <div className="task-editor">
+    <label>Network goal<textarea rows={3} maxLength={500} disabled={!canEdit} value={goal} onChange={event => setGoal(event.target.value)} /></label>
+    {workstreams.map((item, index) => <fieldset key={item.id} disabled={!canEdit}>
+      <legend>Task {index + 1}{index < 2 ? ' · demo' : ''}</legend>
+      <label>Title<input maxLength={120} value={item.title} onChange={event => update(index, 'title', event.target.value)} /></label>
+      <label>Goal<textarea rows={3} maxLength={500} value={item.goal} onChange={event => update(index, 'goal', event.target.value)} /></label>
+      <label>Input<textarea rows={5} maxLength={8000} value={item.input} onChange={event => update(index, 'input', event.target.value)} /></label>
+      {index >= 2 && <button className="danger-link" type="button" onClick={() => setWorkstreams(current => current.filter((_, itemIndex) => itemIndex !== index))}>Remove task</button>}
+    </fieldset>)}
+    <button type="button" disabled={!canEdit || workstreams.length >= 10} onClick={() => setWorkstreams(current => [...current, {
+      id: `new-${Date.now()}`, title: '', goal: '', input: '',
+    }])}>+ Add task</button>
+    <button className="primary full" disabled={!canEdit || !valid || saving} onClick={async () => {
+      setSaving(true);
+      try { await onSave(goal, workstreams); } finally { setSaving(false); }
+    }}>{saving ? 'Saving…' : 'Save tasks'}</button>
+    {!canEdit && <p className="muted">Reset the demo to customize tasks after execution has started.</p>}
+  </div>;
+}
+
+function editableWorkstreams(state: CanvasState): EditableWorkstream[] {
+  return state.task.workstreams.map(({ id, title, goal, input }) => ({ id, title, goal, input }));
+}
 
 function Timeline({ events, selection, onSelect }: { events: TeamEvent[]; selection: Selection; onSelect: (event: TeamEvent) => void }) {
   const visible = events.filter(event => !['model_request', 'tool_start', 'tool_end', 'stream_end'].includes(event.type));
@@ -219,13 +270,14 @@ function processText(run: AgentRun) {
 function Metric({ name, value }: { name: string; value: string }) { return <div><span>{name}</span><b>{value}</b></div>; }
 function label(value: string) { return value.split('_').map(part => part[0].toUpperCase() + part.slice(1)).join(' '); }
 function timelineTitle(event: TeamEvent) {
-  const titles: Record<string, string> = { task_ready: 'Task prepared', execution_mode_changed: 'Execution mode changed', agent_added: 'Agent joined the team', agent_updated: 'Agent settings updated', agent_started: 'Agent started a Todo', agent_completed: 'Agent completed its Todo', router_started: 'JEV received routing input', router_decided: 'JEV chose the next action', workstream_completed: 'Workstream completed', human_question: 'User input requested', human_answered: 'User answered the team', todo_assigned: 'Todo handed to an Agent', fallback_route: 'Fallback routing used', task_completed: 'Task completed', task_paused: 'Task paused', task_resumed: 'Task resumed', step_failed: 'Step failed' };
+  const titles: Record<string, string> = { task_ready: 'Task prepared', task_customized: 'Tasks customized', execution_mode_changed: 'Execution mode changed', agent_added: 'Agent joined the team', agent_updated: 'Agent settings updated', agent_started: 'Agent started a Todo', agent_completed: 'Agent completed its Todo', router_started: 'JEV received routing input', router_decided: 'JEV chose the next action', workstream_completed: 'Workstream completed', human_question: 'User input requested', human_answered: 'User answered the team', todo_assigned: 'Todo handed to an Agent', fallback_route: 'Fallback routing used', task_completed: 'Task completed', task_paused: 'Task paused', task_resumed: 'Task resumed', step_failed: 'Step failed' };
   return titles[event.type] ?? label(event.type);
 }
 function timelineSummary(event: TeamEvent) {
   const payload = event.payload;
   switch (event.type) {
     case 'task_ready': return 'The predefined call-review task and Todo list are ready.';
+    case 'task_customized': return 'The task network was customized before execution.';
     case 'execution_mode_changed': return `Execution mode is now ${String(payload.mode)}.`;
     case 'agent_added': return `${String(payload.name ?? event.actor_id)} is now available for routing.`;
     case 'agent_updated': return `${event.actor_id}'s name changed.`;

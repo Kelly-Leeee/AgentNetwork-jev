@@ -1,4 +1,4 @@
-import type { CanvasState, TeamAgent } from './types';
+import type { CanvasState, TeamAgent, Workstream } from './types';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -20,6 +20,9 @@ export const api = {
     method: 'POST', body: JSON.stringify({ mode }),
   }),
   reset: () => request<CanvasState>('/api/reset', { method: 'POST' }),
+  updateTask: (goal: string, workstreams: Pick<Workstream, 'id' | 'title' | 'goal' | 'input'>[]) => request<CanvasState>('/api/task', {
+    method: 'PATCH', body: JSON.stringify({ goal, workstreams }),
+  }),
   answerHuman: (answer: string) => request<CanvasState>('/api/human-answer', {
     method: 'POST', body: JSON.stringify({ answer }),
   }),

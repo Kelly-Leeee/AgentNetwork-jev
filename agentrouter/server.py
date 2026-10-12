@@ -33,6 +33,18 @@ class HumanAnswer(BaseModel):
     answer: str
 
 
+class WorkstreamUpdate(BaseModel):
+    id: str
+    title: str
+    goal: str
+    input: str
+
+
+class TaskUpdate(BaseModel):
+    goal: str
+    workstreams: list[WorkstreamUpdate]
+
+
 def create_app(settings_path: str | Path = "settings.json") -> FastAPI:
     settings_file = Path(settings_path).expanduser().resolve()
     orchestrator = TeamOrchestrator(load_settings(settings_file), settings_file.parent)
@@ -52,6 +64,18 @@ def create_app(settings_path: str | Path = "settings.json") -> FastAPI:
             return orchestrator.add_agent()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.patch("/api/task")
+    def update_task(update: TaskUpdate):
+        try:
+            return orchestrator.update_task(
+                goal=update.goal,
+                workstreams=[item.model_dump() for item in update.workstreams],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.patch("/api/agents/{agent_id}")
     def update_agent(agent_id: str, update: AgentUpdate):

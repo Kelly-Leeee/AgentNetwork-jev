@@ -108,6 +108,7 @@ export interface TeamEvent {
 export interface CanvasState {
   task: Task;
   agents: TeamAgent[];
+  max_agents: number;
   events: TeamEvent[];
   paused: boolean;
   running: boolean;

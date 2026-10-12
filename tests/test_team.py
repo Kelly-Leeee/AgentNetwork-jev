@@ -228,13 +228,43 @@ class TeamOrchestratorTests(unittest.TestCase):
                 "assign_agent_1", "assign_agent_3", "finish", "needs_human",
             })
 
-    def test_canvas_accepts_at_most_three_agents(self) -> None:
+    def test_canvas_accepts_at_most_five_agents(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             team = TeamOrchestrator(self.settings(root), root)
+            self.assertEqual(team.snapshot()["max_agents"], 5)
             self.assertEqual(team.add_agent()["id"], "agent-3")
-            with self.assertRaisesRegex(ValueError, "at most 3"):
+            self.assertEqual(team.add_agent()["id"], "agent-4")
+            self.assertEqual(team.add_agent()["id"], "agent-5")
+            with self.assertRaisesRegex(ValueError, "at most 5"):
                 team.add_agent()
+
+    def test_demo_tasks_can_be_customized_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            team = TeamOrchestrator(self.settings(root), root)
+            workstreams = [
+                {"id": item["id"], "title": f"Custom {index}",
+                 "goal": f"Goal {index}", "input": f"Input {index}"}
+                for index, item in enumerate(team.task["workstreams"], start=1)
+            ]
+            workstreams.append({
+                "id": "new-client-id", "title": "New task",
+                "goal": "Complete a new task", "input": "New task context",
+            })
+            state = team.update_task(goal="Custom network goal", workstreams=workstreams)
+            self.assertEqual(state["task"]["goal"], "Custom network goal")
+            self.assertEqual(state["task"]["workstreams"][1]["input"], "Input 2")
+            self.assertEqual(len(state["task"]["workstreams"]), 3)
+            custom = state["task"]["workstreams"][2]
+            self.assertTrue(custom["id"].startswith("custom-"))
+            custom_todos = [item for item in state["task"]["todos"]
+                            if item["workstream_id"] == custom["id"]]
+            self.assertEqual([item["step"] for item in custom_todos], [1, 2, 3])
+
+            team._agents["agent-1"].runs.append({"id": "run-1"})
+            with self.assertRaisesRegex(RuntimeError, "Reset the demo"):
+                team.update_task(goal="Another goal", workstreams=workstreams)
 
     def test_name_edit_rebuilds_runtime_and_keeps_agent_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

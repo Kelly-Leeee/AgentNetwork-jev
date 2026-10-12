@@ -14,6 +14,7 @@ AgentRouter 把 JEV 接入了 agent team。它用一个快速的 JEV router 代�
 - 并行 agent orchestration
 - role-free 和 role-optional agent team
 - 动态寻找空闲智能体
+- 可编辑的 demo 任务和用户创建的 workflow
 - human-in-the-loop workflow
 - 使用真实工具的 OpenAI Responses API agent
 
@@ -61,6 +62,6 @@ http://127.0.0.1:8765
 ./start.sh --no-open --host 0.0.0.0
 ```
 
-AgentRouter 目前是早期研究原型，内置一个 demo workflow，最多支持三个智能体。API key 应保存在环境变量中，切勿提交到 Git。
+AgentNetwork 目前是早期研究原型，内置两个可编辑的 demo 任务，也支持用户创建新任务，最多可运行五个智能体。API key 应保存在环境变量中，切勿提交到 Git。
 
 Apache-2.0 license。
