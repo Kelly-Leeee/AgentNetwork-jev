@@ -1,6 +1,6 @@
 # Jev - AgentRouter
 
-[▶ Watch the demo video](demo-video.mov)
+https://github.com/user-attachments/assets/bdd62983-4cd2-4304-8377-77df95ba3102
 
 **A simple, role-optional multi-agent router: one JEV router + general-purpose AI agents.**
 
