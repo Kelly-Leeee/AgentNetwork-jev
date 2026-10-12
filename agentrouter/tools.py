@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
-import re
+import ipaddress
+import socket
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urljoin, urlparse
 
 
 @dataclass(frozen=True)
@@ -71,7 +73,9 @@ def _schema(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
 class WorkspaceTools:
     def __init__(self, workspace: Path, *, allow_write: bool, max_file_chars: int, max_write_chars: int,
                  allow_exec: bool = True, max_command_seconds: float = 60.0,
-                 max_command_output_chars: int = 50_000) -> None:
+                 max_command_output_chars: int = 50_000, allow_web: bool = True,
+                 max_web_results: int = 8, max_web_chars: int = 30_000,
+                 web_timeout_seconds: float = 20.0) -> None:
         self.workspace = workspace.resolve()
         self.allow_write = allow_write
         self.max_file_chars = max_file_chars
@@ -79,6 +83,10 @@ class WorkspaceTools:
         self.allow_exec = allow_exec
         self.max_command_seconds = max_command_seconds
         self.max_command_output_chars = max_command_output_chars
+        self.allow_web = allow_web
+        self.max_web_results = max_web_results
+        self.max_web_chars = max_web_chars
+        self.web_timeout_seconds = web_timeout_seconds
         self._stop_requested = threading.Event()
         self._process_lock = threading.Lock()
         self._active_processes: set[subprocess.Popen[str]] = set()
@@ -93,9 +101,6 @@ class WorkspaceTools:
             "recursive": {"type": "boolean", "description": "Whether to recurse"}}, ["path", "recursive"]), self.list_files))
         registry.register(Tool("read_file", "Read a UTF-8 text file from the workspace.", _schema({
             "path": {"type": "string", "description": "Workspace-relative file path"}}, ["path"]), self.read_file))
-        registry.register(Tool("search_files", "Regex-search UTF-8 files in the workspace.", _schema({
-            "query": {"type": "string", "description": "Python regular expression"},
-            "path": {"type": "string", "description": "Workspace-relative file or directory"}}, ["query", "path"]), self.search_files))
         if self.allow_write:
             registry.register(Tool("write_file", "Write a UTF-8 file inside the workspace, creating parents.", _schema({
                 "path": {"type": "string", "description": "Workspace-relative file path"},
@@ -109,6 +114,14 @@ class WorkspaceTools:
                     "cwd": {"type": "string", "description": "Workspace-relative working directory, or '.'"},
                     "timeout_seconds": {"type": "number", "description": "Positive timeout capped by settings"}
                 }, ["argv", "cwd", "timeout_seconds"]), self.run_command))
+        if self.allow_web:
+            registry.register(Tool("web_search", "Search the public web. Free and no API key required.",
+                _schema({"query": {"type": "string", "description": "Search query"},
+                         "max_results": {"type": "integer", "description": "Number of results"}},
+                        ["query", "max_results"]), self.web_search))
+            registry.register(Tool("web_fetch", "Fetch readable text from a public HTTP(S) URL.",
+                _schema({"url": {"type": "string", "description": "Public HTTP(S) URL"}}, ["url"]),
+                self.web_fetch))
         return registry
 
     def _resolve(self, relative: str) -> Path:
@@ -129,25 +142,6 @@ class WorkspaceTools:
         text = self._resolve(str(args["path"])).read_text(encoding="utf-8")
         return {"content": text[:self.max_file_chars], "truncated": len(text) > self.max_file_chars, "chars": len(text)}
 
-    def search_files(self, args: dict[str, Any]) -> list[dict[str, Any]]:
-        pattern = re.compile(str(args["query"]))
-        target = self._resolve(str(args["path"]))
-        paths = [target] if target.is_file() else target.rglob("*")
-        matches: list[dict[str, Any]] = []
-        for path in paths:
-            if not path.is_file() or ".git" in path.parts:
-                continue
-            try:
-                lines = path.read_text(encoding="utf-8").splitlines()
-            except (UnicodeDecodeError, OSError):
-                continue
-            for line_number, line in enumerate(lines, 1):
-                if pattern.search(line):
-                    matches.append({"path": str(path.relative_to(self.workspace)), "line": line_number, "text": line[:500]})
-                    if len(matches) >= 200:
-                        return matches
-        return matches
-
     def write_file(self, args: dict[str, Any]) -> dict[str, Any]:
         if not self.allow_write:
             raise PermissionError("write_file is disabled")
@@ -158,6 +152,74 @@ class WorkspaceTools:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         return {"path": str(path.relative_to(self.workspace)), "chars_written": len(content)}
+
+    def web_search(self, args: dict[str, Any]) -> list[dict[str, str]]:
+        if not self.allow_web:
+            raise PermissionError("web_search is disabled")
+        query = str(args["query"]).strip()
+        if not query:
+            raise ValueError("query cannot be empty")
+        limit = min(max(int(args["max_results"]), 1), self.max_web_results)
+        from ddgs import DDGS
+
+        results = DDGS(timeout=self.web_timeout_seconds).text(query, max_results=limit)
+        return [{"title": str(item.get("title") or ""),
+                 "url": str(item.get("href") or item.get("url") or ""),
+                 "snippet": str(item.get("body") or item.get("snippet") or "")}
+                for item in results][:limit]
+
+    def web_fetch(self, args: dict[str, Any]) -> dict[str, Any]:
+        if not self.allow_web:
+            raise PermissionError("web_fetch is disabled")
+        import httpx
+        import trafilatura
+
+        url = str(args["url"]).strip()
+        headers = {"User-Agent": "AgentRouter/0.1 (+local agent web fetch)"}
+        with httpx.Client(timeout=self.web_timeout_seconds, headers=headers, follow_redirects=False) as client:
+            for _ in range(6):
+                self._validate_public_url(url)
+                with client.stream("GET", url) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ValueError("redirect response has no Location header")
+                        url = urljoin(url, location)
+                        continue
+                    response.raise_for_status()
+                    content_type = response.headers.get("content-type", "").lower()
+                    if not any(kind in content_type for kind in ("text/", "json", "xml", "html")):
+                        raise ValueError(f"unsupported content type: {content_type or 'unknown'}")
+                    chunks, size = [], 0
+                    byte_limit = self.max_web_chars * 4
+                    for chunk in response.iter_bytes():
+                        size += len(chunk)
+                        if size > byte_limit:
+                            raise ValueError(f"response exceeds byte limit {byte_limit}")
+                        chunks.append(chunk)
+                    raw = b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
+                    extracted = trafilatura.extract(raw, output_format="markdown", include_links=True,
+                                                    include_tables=True) or raw
+                    return {"url": str(response.url), "content_type": content_type,
+                            "content": extracted[:self.max_web_chars],
+                            "truncated": len(extracted) > self.max_web_chars,
+                            "chars": len(extracted)}
+            raise ValueError("too many redirects")
+
+    @staticmethod
+    def _validate_public_url(url: str) -> None:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("url must use http or https and include a hostname")
+        try:
+            addresses = {item[4][0] for item in socket.getaddrinfo(
+                parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM)}
+        except socket.gaierror as exc:
+            raise ValueError(f"cannot resolve hostname: {parsed.hostname}") from exc
+        for address in addresses:
+            if not ipaddress.ip_address(address).is_global:
+                raise PermissionError(f"refusing non-public address: {address}")
 
     def run_command(self, args: dict[str, Any]) -> dict[str, Any]:
         if not self.allow_exec:

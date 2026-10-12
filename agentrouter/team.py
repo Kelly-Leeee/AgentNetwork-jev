@@ -1,0 +1,971 @@
+from __future__ import annotations
+
+import json
+import queue
+import threading
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from copy import deepcopy
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+from uuid import uuid4
+
+from openai import OpenAI
+from typesafe_sdk import Choice, TypeSafeClient
+
+from .agent import Agent
+from .config import Settings
+from .tools import WorkspaceTools
+
+
+TRANSCRIPT = (
+    "I've contacted support three times and nobody has solved my problem. "
+    "Every person asks me to explain everything again. I'm really frustrated "
+    "and I want to speak to someone who can actually help."
+)
+
+RESCHEDULE_REQUEST = (
+    "Please move my onboarding call from Tuesday at 10:00 AM to Thursday at "
+    "2:00 PM. I'm in Melbourne time. Please confirm once it is changed."
+)
+
+DEFAULT_AGENT_SPECS = [
+    ("agent-1", "Agent 1"),
+    ("agent-2", "Agent 2"),
+    ("agent-3", "Agent 3"),
+]
+
+
+class EventHub:
+    def __init__(self) -> None:
+        self._subscribers: set[queue.Queue[dict[str, Any]]] = set()
+        self._lock = threading.Lock()
+
+    def subscribe(self) -> queue.Queue[dict[str, Any]]:
+        channel: queue.Queue[dict[str, Any]] = queue.Queue()
+        with self._lock:
+            self._subscribers.add(channel)
+        return channel
+
+    def unsubscribe(self, channel: queue.Queue[dict[str, Any]]) -> None:
+        with self._lock:
+            self._subscribers.discard(channel)
+
+    def publish(self, event: dict[str, Any]) -> None:
+        with self._lock:
+            subscribers = list(self._subscribers)
+        for channel in subscribers:
+            channel.put(event)
+
+
+@dataclass
+class TeamAgent:
+    id: str
+    name: str
+    runtime: Agent
+    role: str = ""
+    status: str = "idle"
+    current_todo_id: str | None = None
+    last_output: str = ""
+    runs: list[dict[str, Any]] = field(default_factory=list)
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "role": self.role,
+            "status": self.status,
+            "current_todo_id": self.current_todo_id,
+            "last_output": self.last_output,
+            "message_count": len(self.runtime.state.messages),
+            "runs": deepcopy(self.runs),
+        }
+
+
+class TeamOrchestrator:
+    def __init__(self, settings: Settings, project_root: Path) -> None:
+        self.settings = settings
+        self.project_root = project_root.resolve()
+        self.chats_dir = self.project_root / "chats"
+        self.events = EventHub()
+        self._state_lock = threading.RLock()
+        self._run_lock = threading.Lock()
+        self._agents: dict[str, TeamAgent] = {}
+        self._event_log: list[dict[str, Any]] = []
+        self._paused = False
+        self._build_initial_state()
+
+    def _build_initial_state(self) -> None:
+        self.task: dict[str, Any] = {
+            "id": "parallel-demo-001",
+            "goal": "Complete two independent customer-support workstreams in parallel.",
+            "transcript": TRANSCRIPT,
+            "status": "ready",
+            "phase": "agent",
+            "execution_mode": "step",
+            "jev_call_count": 0,
+            "max_jev_calls": 6,
+            "routing_count": 0,
+            "handoff_count": 0,
+            "final_output": "",
+            "last_decision": None,
+            "route_history": [],
+            "pending_human_question": None,
+            "pending_human_questions": [],
+            "human_interactions": [],
+            "workstreams": [
+                {
+                    "id": "support-recovery",
+                    "title": "Frustrated customer response",
+                    "goal": "Produce a send-ready response to a frustrated customer call.",
+                    "input": TRANSCRIPT,
+                    "owner": "agent-1",
+                    "status": "ready",
+                    "final_output": "",
+                },
+                {
+                    "id": "meeting-reschedule",
+                    "title": "Meeting reschedule confirmation",
+                    "goal": "Produce a clear confirmation for a customer requesting a meeting change.",
+                    "input": RESCHEDULE_REQUEST,
+                    "owner": "agent-2",
+                    "status": "ready",
+                    "final_output": "",
+                },
+            ],
+            "todos": [
+                {"id": "support-analyze", "workstream_id": "support-recovery", "step": 1,
+                 "title": "Analyze the call and draft a response", "status": "assigned",
+                 "owner": "agent-1", "result": "", "agent_output": None},
+                {"id": "support-review", "workstream_id": "support-recovery", "step": 2,
+                 "title": "Review empathy and missing next steps", "status": "pending",
+                 "owner": "agent-1", "result": "", "agent_output": None},
+                {"id": "support-finalize", "workstream_id": "support-recovery", "step": 3,
+                 "title": "Finalize the customer response", "status": "pending",
+                 "owner": "agent-1", "result": "", "agent_output": None},
+                {"id": "reschedule-analyze", "workstream_id": "meeting-reschedule", "step": 1,
+                 "title": "Extract the requested schedule change", "status": "assigned",
+                 "owner": "agent-2", "result": "", "agent_output": None},
+                {"id": "reschedule-draft", "workstream_id": "meeting-reschedule", "step": 2,
+                 "title": "Draft the confirmation message", "status": "pending",
+                 "owner": "agent-2", "result": "", "agent_output": None},
+                {"id": "reschedule-finalize", "workstream_id": "meeting-reschedule", "step": 3,
+                 "title": "Check details and finalize", "status": "pending",
+                 "owner": "agent-2", "result": "", "agent_output": None},
+            ],
+        }
+        self._agents.clear()
+        for agent_id, name in DEFAULT_AGENT_SPECS[:2]:
+            self._agents[agent_id] = self._make_agent(agent_id, name)
+        self._event_log.clear()
+        self._emit("task_ready", "system", {"message": "Demo task is ready"})
+
+    def _make_agent(self, agent_id: str, name: str, role: str = "") -> TeamAgent:
+        client = OpenAI(api_key=self.settings.openai.api_key,
+                        base_url=self.settings.openai.base_url,
+                        timeout=self.settings.openai.timeout_seconds)
+        agent_tools = WorkspaceTools(
+            self.settings.agent.workspace,
+            allow_write=self.settings.agent.allow_write,
+            max_file_chars=self.settings.agent.max_file_chars,
+            max_write_chars=self.settings.agent.max_write_chars,
+            allow_exec=self.settings.agent.allow_exec,
+            max_command_seconds=self.settings.agent.max_command_seconds,
+            max_command_output_chars=self.settings.agent.max_command_output_chars,
+            allow_web=self.settings.agent.allow_web,
+            max_web_results=self.settings.agent.max_web_results,
+            max_web_chars=self.settings.agent.max_web_chars,
+            web_timeout_seconds=self.settings.agent.web_timeout_seconds,
+        ).registry()
+        prompt = (
+            f"{self.settings.agent.system_prompt}\n\n"
+            "You are working inside a team orchestrator. Your primary responsibility is to "
+            "complete the task assigned by the orchestrator. Focus on that assignment rather "
+            "than taking over the whole workflow. When finished, return a concise, useful result "
+            "and stop calling tools. You are a peer worker with full general-purpose capabilities."
+        )
+        if role:
+            prompt += (
+                "\n\nYour user-configured role for this agent is:\n"
+                f"{role}\n"
+                "Use this role as a behavioral focus when completing assignments, while retaining "
+                "your full general-purpose capabilities."
+            )
+        runtime = Agent(
+            client=client,
+            model=self.settings.openai.model,
+            system_prompt=prompt,
+            tools=agent_tools,
+            max_tool_rounds=self.settings.agent.max_tool_rounds,
+            max_output_tokens=self.settings.agent.max_output_tokens,
+            streaming=False,
+            agent_id=agent_id,
+            chats_dir=self.chats_dir,
+            on_event=lambda kind, payload, aid=agent_id: self._agent_event(aid, kind, payload),
+        )
+        return TeamAgent(agent_id, name, runtime, role=role)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._state_lock:
+            return {
+                "task": deepcopy(self.task),
+                "agents": [agent.public() for agent in self._agents.values()],
+                "events": deepcopy(self._event_log[-80:]),
+                "paused": self._paused,
+                "running": self._run_lock.locked(),
+            }
+
+    def add_agent(self) -> dict[str, Any]:
+        with self._state_lock:
+            if len(self._agents) >= 3:
+                raise ValueError("The canvas supports at most 3 agents")
+            spec = DEFAULT_AGENT_SPECS[len(self._agents)]
+            agent = self._make_agent(*spec)
+            self._agents[agent.id] = agent
+            self._emit("agent_added", agent.id, {"name": agent.name})
+            return agent.public()
+
+    def update_agent(self, agent_id: str, *, name: str,
+                     role: str | None = None) -> dict[str, Any]:
+        with self._state_lock:
+            agent = self._require_agent(agent_id)
+            name = name.strip()
+            if not name:
+                raise ValueError("name cannot be empty")
+            if len(name) > 40:
+                raise ValueError("name is too long")
+            if role is not None:
+                role = role.strip()
+                if "\n" in role or "\r" in role:
+                    raise ValueError("role must be a single line")
+                if len(role) > 240:
+                    raise ValueError("role is too long")
+                agent.role = role
+            agent.name = name
+            # ChatStore restores this agent's isolated conversation automatically.
+            agent.runtime = self._make_agent(agent_id, name, agent.role).runtime
+            self._emit("agent_updated", agent_id, {"name": name, "role": agent.role})
+            return agent.public()
+
+    def set_paused(self, paused: bool) -> None:
+        with self._state_lock:
+            self._paused = paused
+            self._emit("task_paused" if paused else "task_resumed", "system", {})
+
+    def submit_human_answer(self, answer: str) -> dict[str, Any]:
+        with self._state_lock:
+            pending = self.task.get("pending_human_question")
+            answer = answer.strip()
+            if not pending:
+                raise RuntimeError("There is no pending question for the user")
+            if not answer:
+                raise ValueError("The answer cannot be empty")
+            if len(answer) > 4000:
+                raise ValueError("The answer is too long")
+            interaction = {**pending, "answer": answer,
+                           "answered_at": datetime.now(timezone.utc).isoformat()}
+            self.task["human_interactions"].append(interaction)
+            workstream_id = interaction.get("workstream_id")
+            queued = self.task["pending_human_questions"]
+            self.task["pending_human_question"] = queued.pop(0) if queued else None
+            # A user answer explicitly authorizes one additional JEV re-evaluation.
+            self.task["max_jev_calls"] += 1
+            self.task["status"] = "ready"
+            self.task["phase"] = "agent"
+            if workstream_id:
+                self._workstream(workstream_id)["status"] = "ready"
+            self._emit("human_answered", "ask-user", {
+                "question": interaction["question"], "answer": answer,
+                "workstream_id": workstream_id,
+            })
+        if workstream_id:
+            self._route_completed_workstream(workstream_id)
+        with self._state_lock:
+            auto_resume = (
+                self.task["execution_mode"] == "auto"
+                and not self._run_lock.locked()
+                and any(item["status"] == "assigned" for item in self.task["todos"])
+            )
+        if auto_resume:
+            return self.run_next()
+        return self.snapshot()
+
+    def reset(self) -> dict[str, Any]:
+        if self._run_lock.locked():
+            raise RuntimeError("Cannot reset while a step is running")
+        with self._state_lock:
+            for agent in self._agents.values():
+                agent.runtime.reset()
+            self._paused = False
+            self._build_initial_state()
+            return self.snapshot()
+
+    def run_next(self) -> dict[str, Any]:
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError("A step is already running")
+        try:
+            with self._state_lock:
+                if self._paused:
+                    raise RuntimeError("The task is paused")
+                if self.task["status"] == "completed":
+                    return self.snapshot()
+                self.task["status"] = "running"
+                phase = self.task["phase"]
+            if phase == "agent":
+                self._run_agent_wave(auto_chain=self.task["execution_mode"] == "auto")
+            elif phase == "router":
+                self._run_router_step()
+            elif phase == "human":
+                raise RuntimeError("Answer the pending user question before continuing")
+            else:
+                raise RuntimeError(f"Unknown task phase: {phase}")
+            return self.snapshot()
+        except Exception as exc:
+            with self._state_lock:
+                if self.task.get("pending_human_question"):
+                    self.task["status"] = "needs_human"
+                else:
+                    self.task["status"] = "failed"
+                    self._emit("step_failed", "system", {"error": f"{type(exc).__name__}: {exc}"})
+            raise
+        finally:
+            self._run_lock.release()
+
+    def set_execution_mode(self, mode: str) -> dict[str, Any]:
+        if mode not in {"step", "auto"}:
+            raise ValueError("execution mode must be 'step' or 'auto'")
+        with self._state_lock:
+            if self._run_lock.locked():
+                raise RuntimeError("Cannot change execution mode while work is running")
+            self.task["execution_mode"] = mode
+            self._emit("execution_mode_changed", "system", {"mode": mode})
+            return self.snapshot()
+
+    def _run_agent_wave(self, *, auto_chain: bool = False) -> None:
+        """Run ready todos concurrently, dynamically filling free agents in auto mode."""
+        with self._state_lock:
+            todos = self._next_assigned_todos_by_agent()
+        if not todos:
+            self._assign_next_workstream_steps()
+            with self._state_lock:
+                todos = self._next_assigned_todos_by_agent()
+        if not todos:
+            with self._state_lock:
+                self._complete_parallel_demo_if_done()
+                if self.task["status"] != "completed":
+                    self.task["status"] = "ready"
+                    self.task["phase"] = "agent"
+            return
+
+        errors: list[Exception] = []
+        submitted: set[str] = set()
+        futures: dict[Future[None], str] = {}
+
+        def submit_ready(pool: ThreadPoolExecutor) -> None:
+            with self._state_lock:
+                ready = self._next_assigned_todos_by_agent()
+                for ready_todo in ready:
+                    if ready_todo["id"] in submitted:
+                        continue
+                    submitted.add(ready_todo["id"])
+                    futures[pool.submit(self._run_one_todo_then_route, ready_todo)] = ready_todo["id"]
+
+        with ThreadPoolExecutor(
+            max_workers=len(self._agents), thread_name_prefix="agent-workstream"
+        ) as pool:
+            submit_ready(pool)
+            while futures:
+                completed, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+                for future in completed:
+                    futures.pop(future)
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        errors.append(exc)
+                if auto_chain and not errors:
+                    with self._state_lock:
+                        may_continue = (
+                            not self._paused
+                            and self.task["status"] not in {"completed", "failed"}
+                        )
+                    if may_continue:
+                        submit_ready(pool)
+        if errors:
+            raise errors[0]
+        with self._state_lock:
+            self._complete_parallel_demo_if_done()
+            if self.task["status"] != "completed":
+                self.task["status"] = "ready"
+                self.task["phase"] = "agent"
+
+    def _run_one_todo_then_route(self, todo: dict[str, Any]) -> None:
+        self._run_one_todo(todo)
+        self._route_completed_workstream(todo["workstream_id"])
+
+    def _next_assigned_todos_by_agent(self) -> list[dict[str, Any]]:
+        """Return at most one queued todo per agent for the next parallel wave."""
+        selected: dict[str, dict[str, Any]] = {}
+        for todo in sorted(self.task["todos"], key=lambda item: (item["step"], item["id"])):
+            owner = todo.get("owner")
+            if todo["status"] == "assigned" and owner and owner not in selected:
+                selected[owner] = todo
+        return list(selected.values())
+
+    def _run_one_todo(self, todo: dict[str, Any]) -> None:
+        with self._state_lock:
+            agent = self._require_agent(todo["owner"])
+            todo["status"] = "running"
+            workstream = self._workstream(todo["workstream_id"])
+            workstream["status"] = "running"
+            agent.status = "running"
+            agent.current_todo_id = todo["id"]
+            self._emit("agent_started", agent.id, {"todo_id": todo["id"], "title": todo["title"]})
+            assignment = self._assignment_prompt(agent, todo)
+            run_record = {
+                "id": uuid4().hex,
+                "todo_id": todo["id"],
+                "todo_title": todo["title"],
+                "input": assignment,
+                "process": [],
+                "output": "",
+                "status": "running",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "completed_at": None,
+                "model_calls": 0,
+                "tool_calls": 0,
+            }
+            agent.runs.append(run_record)
+
+        try:
+            result = agent.runtime.prompt(assignment)
+        except Exception:
+            with self._state_lock:
+                agent.status = "idle"
+                agent.current_todo_id = None
+                run_record["status"] = "failed"
+                run_record["completed_at"] = datetime.now(timezone.utc).isoformat()
+                todo["status"] = "failed"
+                workstream["status"] = "failed"
+            raise
+
+        with self._state_lock:
+            agent.status = "idle"
+            agent.current_todo_id = None
+            agent_output = self._normalize_agent_output(result.output)
+            canonical_output = json.dumps(agent_output, ensure_ascii=False, indent=2)
+            agent.last_output = canonical_output
+            run_record["output"] = canonical_output
+            run_record["status"] = "completed"
+            run_record["completed_at"] = datetime.now(timezone.utc).isoformat()
+            run_record["model_calls"] = result.model_call_count
+            run_record["tool_calls"] = result.tool_call_count
+            todo["status"] = "completed"
+            todo["result"] = canonical_output
+            todo["agent_output"] = agent_output
+            self._emit("agent_completed", agent.id, {
+                "todo_id": todo["id"], "output": canonical_output,
+                "model_calls": result.model_call_count, "tool_calls": result.tool_call_count,
+            })
+            workstream["status"] = "ready"
+
+    def _route_completed_workstream(self, workstream_id: str) -> None:
+        """Route a completed workstream immediately, without waiting for peer agents."""
+        with self._state_lock:
+            workstream = self._workstream(workstream_id)
+            todos = sorted(
+                (item for item in self.task["todos"] if item["workstream_id"] == workstream_id),
+                key=lambda item: item["step"],
+            )
+            remaining = [item for item in todos if item["status"] == "pending"]
+            if self.task["jev_call_count"] >= self.task["max_jev_calls"]:
+                self._apply_workstream_fallback(workstream, remaining)
+                return
+            latest = next((item for item in reversed(todos) if item["status"] == "completed"), None)
+            source_agent = self._agents.get(latest["owner"]) if latest else None
+            if source_agent is not None:
+                source_agent.status = "routing"
+            state = {
+                "overall_goal": self.task["goal"],
+                "workstream": {
+                    "id": workstream["id"],
+                    "title": workstream["title"],
+                    "goal": workstream["goal"],
+                    "status": workstream["status"],
+                },
+                "completed_step": ({
+                    "id": latest["id"], "title": latest["title"], "step": latest["step"],
+                    "owner": latest["owner"], "agent_output": self._todo_agent_output(latest),
+                } if latest else None),
+                "remaining_steps": [
+                    {"id": item["id"], "title": item["title"], "step": item["step"]}
+                    for item in remaining
+                ],
+                "latest_human_interaction": next((
+                    deepcopy(item) for item in reversed(self.task["human_interactions"])
+                    if item.get("workstream_id") == workstream_id
+                ), None),
+                "agents": [self._router_agent_state(agent) for agent in self._agents.values()],
+            }
+            criteria = self._workstream_route_criteria(source_agent)
+            self.task["routing_count"] += 1
+            workstream["status"] = "routing"
+            self._emit("router_started", "jev", {
+                "workstream_id": workstream_id, "state": state, "criteria": criteria,
+            })
+
+        route_record = {
+            "id": uuid4().hex,
+            "workstream_id": workstream_id,
+            "input": state,
+            "question": {
+                "type": "choice",
+                "instructions": (
+                    "Choose the next action for this workstream only. Consider the latest output, "
+                    "the remaining planned steps, and current agent availability. Finish early only "
+                    "when the artifact is already send-ready and the remaining steps add no value."
+                ),
+                "criteria": criteria,
+            },
+            "output": None,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": None,
+        }
+        try:
+            with TypeSafeClient(api_key=self.settings.jev.api_key,
+                                model=self.settings.jev.model) as client:
+                response = client.system_one(
+                    state=state,
+                    questions={"next_action": Choice(
+                        instructions=route_record["question"]["instructions"],
+                        criteria=criteria,
+                    )},
+                )
+            answer = response.choices["next_action"]
+            raw = response.raw_http_response.json()
+            decision = {
+                "choice": answer.choice,
+                "confidence": answer.confidence,
+                "probabilities": answer.probabilities,
+                "model": raw.get("model"),
+                "usage": raw.get("usage", {}),
+                "workstream_id": workstream_id,
+            }
+            with self._state_lock:
+                self.task["jev_call_count"] += 1
+                self.task["last_decision"] = decision
+                route_record["output"] = decision
+                route_record["completed_at"] = datetime.now(timezone.utc).isoformat()
+                self.task["route_history"].append(route_record)
+                self._emit("router_decided", "jev", decision)
+                self._apply_workstream_decision(workstream, remaining, answer.choice)
+        finally:
+            with self._state_lock:
+                self.task["routing_count"] = max(0, self.task["routing_count"] - 1)
+                if source_agent is not None and source_agent.status == "routing":
+                    source_agent.status = (
+                        "assigned" if any(
+                            item["status"] == "assigned" and item.get("owner") == source_agent.id
+                            for item in self.task["todos"]
+                        ) else "idle"
+                    )
+
+    def _workstream_route_criteria(self, source_agent: TeamAgent | None = None) -> dict[str, str]:
+        criteria = {
+            f"assign_{agent.id.replace('-', '_')}": (
+                f"Assign the next step to available peer {agent.name}; current status: {agent.status}."
+            )
+            for agent in self._agents.values()
+            if agent.status == "idle" or agent is source_agent
+        }
+        criteria["finish"] = (
+            "The workstream output is complete and no remaining planned step is needed"
+        )
+        criteria["needs_human"] = (
+            "The workstream cannot safely continue without information only the user can provide"
+        )
+        return criteria
+
+    def _apply_workstream_decision(self, workstream: dict[str, Any],
+                                   remaining: list[dict[str, Any]], choice: str) -> None:
+        if choice == "needs_human":
+            latest = next(
+                item for item in reversed(self.task["todos"])
+                if item["workstream_id"] == workstream["id"] and item["status"] == "completed"
+            )
+            unresolved = self._todo_agent_output(latest).get("unresolved", [])
+            details = "\n".join(f"- {item}" for item in unresolved)
+            question = (
+                f"The workstream needs your input on:\n{details}" if details
+                else f"What information should the team use to continue {workstream['title']}?"
+            )
+            request = {
+                "id": uuid4().hex,
+                "workstream_id": workstream["id"],
+                "question": question,
+                "asked_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if self.task["pending_human_question"] is None:
+                self.task["pending_human_question"] = request
+            else:
+                self.task["pending_human_questions"].append(request)
+            workstream["status"] = "waiting_human"
+            self._emit("human_question", "ask-user", {
+                "workstream_id": workstream["id"], "question": question,
+            })
+            return
+        if choice == "finish" or not remaining:
+            latest = next(
+                item for item in reversed(self.task["todos"])
+                if item["workstream_id"] == workstream["id"] and item["status"] == "completed"
+            )
+            workstream["final_output"] = self._artifact_text(
+                self._todo_agent_output(latest)["artifact"]
+            )
+            workstream["status"] = "completed"
+            for item in remaining:
+                item["status"] = "skipped"
+            self._emit("workstream_completed", "jev", {
+                "workstream_id": workstream["id"],
+                "final_output": workstream["final_output"],
+            })
+            return
+        agent_id = choice.removeprefix("assign_").replace("_", "-")
+        agent = self._agents.get(agent_id)
+        if agent is None or agent.status not in {"idle", "routing"}:
+            self._apply_workstream_fallback(workstream, remaining)
+            return
+        next_todo = remaining[0]
+        next_todo["owner"] = agent_id
+        next_todo["status"] = "assigned"
+        agent.status = "assigned"
+        workstream["owner"] = agent_id
+        workstream["status"] = "ready"
+        self.task["handoff_count"] += 1
+        self._emit("todo_assigned", agent_id, {
+            "todo_id": next_todo["id"], "title": next_todo["title"],
+            "workstream_id": workstream["id"],
+        })
+
+    def _apply_workstream_fallback(self, workstream: dict[str, Any],
+                                   remaining: list[dict[str, Any]]) -> None:
+        if not remaining:
+            self._apply_workstream_decision(workstream, remaining, "finish")
+            return
+        preferred = self._agents.get(workstream["owner"])
+        available = preferred if preferred and preferred.status == "idle" else next(
+            (agent for agent in self._agents.values() if agent.status == "idle"), None
+        )
+        if available is None:
+            workstream["status"] = "waiting"
+            return
+        next_todo = remaining[0]
+        next_todo["owner"] = available.id
+        next_todo["status"] = "assigned"
+        available.status = "assigned"
+        workstream["owner"] = available.id
+        workstream["status"] = "ready"
+        self._emit("fallback_route", available.id, {
+            "todo_id": next_todo["id"], "workstream_id": workstream["id"],
+        })
+
+    def _assign_next_workstream_steps(self) -> None:
+        with self._state_lock:
+            for workstream in self.task["workstreams"]:
+                todos = sorted(
+                    (item for item in self.task["todos"]
+                     if item["workstream_id"] == workstream["id"]),
+                    key=lambda item: item["step"],
+                )
+                if any(item["status"] in {"assigned", "running", "failed"} for item in todos):
+                    continue
+                pending = next((item for item in todos if item["status"] == "pending"), None)
+                if pending is not None:
+                    pending["status"] = "assigned"
+                    self._emit("todo_assigned", pending["owner"], {
+                        "todo_id": pending["id"], "title": pending["title"],
+                        "workstream_id": workstream["id"],
+                    })
+
+    def _complete_parallel_demo_if_done(self) -> None:
+        for workstream in self.task["workstreams"]:
+            todos = [item for item in self.task["todos"]
+                     if item["workstream_id"] == workstream["id"]]
+            if todos and all(item["status"] == "completed" for item in todos):
+                latest = max(todos, key=lambda item: item["step"])
+                output = self._todo_agent_output(latest)
+                workstream["final_output"] = self._artifact_text(output["artifact"])
+                workstream["status"] = "completed"
+        if all(item["status"] == "completed" for item in self.task["workstreams"]):
+            self.task["final_output"] = json.dumps({
+                item["id"]: item["final_output"] for item in self.task["workstreams"]
+            }, ensure_ascii=False, indent=2)
+            self.task["status"] = "completed"
+            self.task["phase"] = "done"
+            self._emit("task_completed", "system", {"final_output": self.task["final_output"]})
+
+    def _run_router_step(self) -> None:
+        with self._state_lock:
+            if not self.settings.jev.api_key:
+                raise ValueError("JEV API key is empty in settings.json")
+            if self.task["jev_call_count"] >= self.task["max_jev_calls"]:
+                self._apply_fallback_route()
+                return
+            state = self._compact_router_state()
+            criteria = {
+                f"assign_{agent.id.replace('-', '_')}": f"Assign the next work to idle peer {agent.name}"
+                for agent in self._agents.values()
+                if agent.status == "idle"
+            }
+            criteria.update({
+                "finish": "The latest result is already send-ready; no more agent work is required",
+                "needs_human": "The next step requires a human decision",
+            })
+            self._emit("router_started", "jev", {"state": state, "criteria": criteria})
+
+        route_record = {
+            "id": uuid4().hex,
+            "input": state,
+            "question": {
+                "type": "choice",
+                "instructions": (
+                    "Choose the best next team action. Use the latest completed work, remaining "
+                    "todo, latest user answer when present, and each agent's live status. "
+                    "Choose needs_human only when the missing information must come from the user. "
+                    "Prefer independent review before finishing when the current result still has "
+                    "important omissions."
+                ),
+                "criteria": criteria,
+            },
+            "output": None,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": None,
+        }
+
+        with TypeSafeClient(api_key=self.settings.jev.api_key, model=self.settings.jev.model) as client:
+            response = client.system_one(
+                state=state,
+                questions={"next_action": Choice(
+                    instructions=route_record["question"]["instructions"],
+                    criteria=criteria,
+                )},
+            )
+        answer = response.choices["next_action"]
+        raw = response.raw_http_response.json()
+        decision = {
+            "choice": answer.choice,
+            "confidence": answer.confidence,
+            "probabilities": answer.probabilities,
+            "model": raw.get("model"),
+            "usage": raw.get("usage", {}),
+        }
+
+        with self._state_lock:
+            self.task["jev_call_count"] += 1
+            self.task["last_decision"] = decision
+            route_record["output"] = decision
+            route_record["completed_at"] = datetime.now(timezone.utc).isoformat()
+            self.task["route_history"].append(route_record)
+            self._emit("router_decided", "jev", decision)
+            self._apply_decision(answer.choice)
+
+    def _apply_decision(self, choice: str) -> None:
+        remaining = [todo for todo in self.task["todos"] if todo["status"] == "pending"]
+        if choice == "needs_human":
+            latest = next((todo for todo in reversed(self.task["todos"]) if todo["result"]), None)
+            output = self._todo_agent_output(latest) if latest else {"unresolved": []}
+            unresolved = output.get("unresolved", [])
+            if unresolved:
+                details = "\n".join(f"- {item}" for item in unresolved)
+                question = f"The team needs your input on the following unresolved items:\n{details}"
+            else:
+                question = "What additional information should the team use before continuing?"
+            self.task["pending_human_question"] = {
+                "id": uuid4().hex,
+                "question": question,
+                "asked_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self.task["status"] = "needs_human"
+            self.task["phase"] = "human"
+            self._emit("human_question", "ask-user", {"question": question})
+            return
+        if choice == "finish":
+            latest = next((todo for todo in reversed(self.task["todos"]) if todo["result"]), None)
+            output = self._todo_agent_output(latest) if latest else {"artifact": "", "unresolved": []}
+            self.task["final_output"] = self._artifact_text(output["artifact"])
+            for todo in remaining:
+                todo["status"] = "skipped"
+            self.task["status"] = "completed"
+            self.task["phase"] = "done"
+            self._emit("task_completed", "jev", {"final_output": self.task["final_output"]})
+            return
+        agent_id = choice.removeprefix("assign_").replace("_", "-")
+        if agent_id not in self._agents:
+            self._apply_fallback_route()
+            return
+        if not remaining:
+            self.task["status"] = "completed"
+            self.task["phase"] = "done"
+            return
+        todo = remaining[0]
+        todo["owner"] = agent_id
+        todo["status"] = "assigned"
+        self.task["handoff_count"] += 1
+        self.task["phase"] = "agent"
+        self._emit("todo_assigned", agent_id, {"todo_id": todo["id"], "title": todo["title"]})
+
+    def _apply_fallback_route(self) -> None:
+        remaining = [todo for todo in self.task["todos"] if todo["status"] == "pending"]
+        if not remaining:
+            self.task["status"] = "completed"
+            self.task["phase"] = "done"
+            return
+        assignment_counts = {
+            agent_id: sum(1 for todo in self.task["todos"] if todo.get("owner") == agent_id)
+            for agent_id in self._agents
+        }
+        available = min(
+            (agent for agent in self._agents.values() if agent.status == "idle"),
+            key=lambda agent: assignment_counts[agent.id],
+            default=None,
+        )
+        if available is None:
+            raise RuntimeError("No idle agent is available")
+        todo = remaining[0]
+        todo["owner"], todo["status"] = available.id, "assigned"
+        self.task["phase"] = "agent"
+        self._emit("fallback_route", available.id, {"todo_id": todo["id"]})
+
+    def _assignment_prompt(self, agent: TeamAgent, todo: dict[str, Any]) -> str:
+        workstream = self._workstream(todo["workstream_id"])
+        completed = [{"title": item["title"], "agent_output": self._todo_agent_output(item)}
+                     for item in self.task["todos"]
+                     if item["workstream_id"] == workstream["id"]
+                     and item["status"] == "completed"]
+        return (
+            f"Workstream:\n{workstream['title']}\n\n"
+            f"Workstream goal:\n{workstream['goal']}\n\n"
+            f"Workstream input:\n{workstream['input']}\n\n"
+            f"Your assigned todo:\n{todo['title']}\n\n"
+            f"Previous completed work:\n{json.dumps(completed, ensure_ascii=False)}\n\n"
+            "Return exactly one valid JSON object with only these two top-level keys:\n"
+            "{\"artifact\": <the completed work>, \"unresolved\": [<remaining issue>, ...]}\n"
+            "The artifact may be a string, object, or array and must contain the actual completed "
+            "work. The unresolved value must be an array of short English strings. Use an empty "
+            "array only when you found no remaining issues. Do not recommend or name the next agent. "
+            "All content must be written in English. Do not include Markdown fences or any text "
+            "outside the JSON object."
+        )
+
+    def _workstream(self, workstream_id: str) -> dict[str, Any]:
+        workstream = next((item for item in self.task["workstreams"]
+                           if item["id"] == workstream_id), None)
+        if workstream is None:
+            raise ValueError(f"Unknown workstream: {workstream_id}")
+        return workstream
+
+    def _compact_router_state(self) -> dict[str, Any]:
+        completed = [item for item in self.task["todos"] if item["status"] == "completed"]
+        latest = completed[-1] if completed else None
+        state = {
+            "goal": self.task["goal"],
+            "completed_todo": ({
+                "title": latest["title"],
+                "agent_id": latest["owner"],
+            } if latest else None),
+            "agent_output": self._todo_agent_output(latest) if latest else None,
+            "latest_human_interaction": (
+                deepcopy(self.task["human_interactions"][-1])
+                if self.task["human_interactions"] else None
+            ),
+            "remaining_todos": [item["title"] for item in self.task["todos"]
+                                if item["status"] == "pending"],
+            "available_agents": [self._router_agent_state(agent)
+                                  for agent in self._agents.values() if agent.status == "idle"],
+        }
+        return state
+
+    @staticmethod
+    def _router_agent_state(agent: TeamAgent) -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "id": agent.id,
+            "status": agent.status,
+            "current_todo_id": agent.current_todo_id,
+        }
+        if agent.role:
+            state["role"] = agent.role
+        return state
+
+    @staticmethod
+    def _normalize_agent_output(raw_output: str) -> dict[str, Any]:
+        candidate = raw_output.strip()
+        if candidate.startswith("```"):
+            lines = candidate.splitlines()
+            candidate = "\n".join(lines[1:-1]).strip() if len(lines) >= 3 else candidate
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            return {
+                "artifact": raw_output,
+                "unresolved": ["The response did not follow the required structured output format."],
+            }
+        if not isinstance(parsed, dict) or "artifact" not in parsed:
+            return {
+                "artifact": parsed,
+                "unresolved": ["The response did not include the required artifact field."],
+            }
+        unresolved = parsed.get("unresolved", [])
+        if not isinstance(unresolved, list):
+            unresolved = [str(unresolved)]
+        return {
+            "artifact": parsed["artifact"],
+            "unresolved": [str(item) for item in unresolved],
+        }
+
+    def _todo_agent_output(self, todo: dict[str, Any]) -> dict[str, Any]:
+        stored = todo.get("agent_output")
+        if isinstance(stored, dict):
+            return deepcopy(stored)
+        return self._normalize_agent_output(str(todo.get("result", "")))
+
+    @staticmethod
+    def _artifact_text(artifact: Any) -> str:
+        if isinstance(artifact, str):
+            return artifact
+        return json.dumps(artifact, ensure_ascii=False, indent=2)
+
+    def _agent_event(self, agent_id: str, kind: str, payload: dict[str, Any]) -> None:
+        if kind in {"model_request", "tool_start", "tool_end", "stream_end"}:
+            safe = dict(payload)
+            if "output" in safe:
+                safe["output"] = str(safe["output"])[:1000]
+            with self._state_lock:
+                agent = self._agents.get(agent_id)
+                active_run = agent.runs[-1] if agent and agent.runs and agent.runs[-1]["status"] == "running" else None
+                if active_run is not None:
+                    active_run["process"].append({
+                        "type": kind,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "payload": safe,
+                    })
+            self._emit(kind, agent_id, safe)
+
+    def _emit(self, event_type: str, actor_id: str, payload: dict[str, Any]) -> None:
+        event = {
+            "id": uuid4().hex,
+            "type": event_type,
+            "actor_id": actor_id,
+            "payload": payload,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        with self._state_lock:
+            self._event_log.append(event)
+            if len(self._event_log) > 200:
+                del self._event_log[:-200]
+        self.events.publish(event)
+
+    def _require_agent(self, agent_id: str) -> TeamAgent:
+        try:
+            return self._agents[agent_id]
+        except KeyError as exc:
+            raise ValueError(f"Unknown agent: {agent_id}") from exc

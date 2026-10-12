@@ -204,6 +204,7 @@ cython_debug/
 # .vscode/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
+*.tsbuildinfo
 
 # Ruff stuff:
 .ruff_cache/
@@ -220,4 +221,12 @@ __marimo__/
 .streamlit/secrets.toml
 
 # AgentRouter local settings
+settings.json
 settings.local.json
+
+# Local agent conversation history
+chats/
+
+# Agent canvas frontend
+frontend/node_modules/
+agentrouter/web/dist/
