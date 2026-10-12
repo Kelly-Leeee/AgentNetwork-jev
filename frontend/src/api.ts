@@ -20,7 +20,7 @@ export const api = {
     method: 'POST', body: JSON.stringify({ mode }),
   }),
   reset: () => request<CanvasState>('/api/reset', { method: 'POST' }),
-  updateTask: (goal: string, workstreams: Pick<Workstream, 'id' | 'title' | 'goal' | 'input'>[]) => request<CanvasState>('/api/task', {
+  updateTask: (goal: string, workstreams: Array<Pick<Workstream, 'id' | 'title' | 'goal' | 'input'> & { todos: string[] }>) => request<CanvasState>('/api/task', {
     method: 'PATCH', body: JSON.stringify({ goal, workstreams }),
   }),
   answerHuman: (answer: string) => request<CanvasState>('/api/human-answer', {

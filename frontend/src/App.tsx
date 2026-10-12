@@ -28,6 +28,7 @@ export function App() {
   const [selection, setSelection] = useState<Selection>(null);
   const [error, setError] = useState('');
   const [taskEditorOpen, setTaskEditorOpen] = useState(false);
+  const [leftPanelWidth, setLeftPanelWidth] = useState(320);
   const [nodes, setNodes, onNodesChange] = useNodesState<AgentFlowNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const flow = useRef<ReactFlowInstance<AgentFlowNode, Edge> | null>(null);
@@ -99,6 +100,19 @@ export function App() {
     catch (cause) { setError(messageOf(cause)); await refresh(); }
   };
 
+  const startPanelResize = (event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = leftPanelWidth;
+    const move = (pointerEvent: PointerEvent) => setLeftPanelWidth(Math.min(480, Math.max(250, startWidth + pointerEvent.clientX - startX)));
+    const stop = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', stop);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop);
+  };
+
   if (!state) return <div className="loading">Loading Agent Team Canvas…</div>;
   const completed = state.task.todos.filter(todo => ['completed', 'skipped'].includes(todo.status)).length;
   const hasRunnableWork = state.task.todos.some(todo => todo.status === 'assigned');
@@ -125,7 +139,7 @@ export function App() {
         </div>
       </header>
 
-      <div className={`workspace ${selection ? 'has-selection' : ''}`}>
+      <div className={`workspace ${selection ? 'has-selection' : ''}`} style={{ '--left-panel-width': `${leftPanelWidth}px` } as React.CSSProperties}>
         <aside className="left-panel panel">
           <p className="eyebrow">Parallel demo</p><h2>{state.task.goal}</h2>
           <button className="link" onClick={() => setTaskEditorOpen(value => !value)}>{taskEditorOpen ? 'Hide task editor' : 'Customize tasks'}</button>
@@ -137,6 +151,11 @@ export function App() {
           </section>)}
           <div className="add-agent"><button disabled={state.agents.length >= state.max_agents || state.running} onClick={async () => { try { await api.addAgent(); await refresh(); } catch (cause) { setError(messageOf(cause)); } }}>{state.agents.length >= state.max_agents ? `${state.max_agents} agents added` : '+ Add agent'}</button><p>All agents are peer workers. Routing uses live status, not predefined roles.</p></div>
         </aside>
+
+        <div className="panel-resizer" role="separator" aria-label="Resize task panel" aria-orientation="vertical" tabIndex={0} onPointerDown={startPanelResize} onKeyDown={event => {
+          if (event.key === 'ArrowLeft') setLeftPanelWidth(width => Math.max(250, width - 16));
+          if (event.key === 'ArrowRight') setLeftPanelWidth(width => Math.min(480, width + 16));
+        }} />
 
         <main className="center">
           <div className="canvas-status"><span><i />{phaseText(state)}</span><span>Drag nodes to arrange the team</span></div>
@@ -157,7 +176,7 @@ export function App() {
 
 function Pill({ children }: { children: React.ReactNode }) { return <span className="pill">{children}</span>; }
 
-type EditableWorkstream = Pick<Workstream, 'id' | 'title' | 'goal' | 'input'>;
+type EditableWorkstream = Pick<Workstream, 'id' | 'title' | 'goal' | 'input'> & { todos: string[] };
 
 function TaskEditor({ state, onSave }: {
   state: CanvasState;
@@ -175,8 +194,13 @@ function TaskEditor({ state, onSave }: {
   const update = (index: number, field: 'title' | 'goal' | 'input', value: string) => {
     setWorkstreams(current => current.map((item, itemIndex) => itemIndex === index ? { ...item, [field]: value } : item));
   };
+  const updateTodo = (taskIndex: number, todoIndex: number, value: string) => {
+    setWorkstreams(current => current.map((item, itemIndex) => itemIndex === taskIndex ? {
+      ...item, todos: item.todos.map((todo, index) => index === todoIndex ? value : todo),
+    } : item));
+  };
   const canEdit = !state.running && state.task.jev_call_count === 0 && state.agents.every(agent => agent.runs.length === 0);
-  const valid = Boolean(goal.trim()) && workstreams.every(item => item.title.trim() && item.goal.trim() && item.input.trim());
+  const valid = Boolean(goal.trim()) && workstreams.every(item => item.title.trim() && item.goal.trim() && item.input.trim() && item.todos.length > 0 && item.todos.every(todo => todo.trim()));
 
   return <div className="task-editor">
     <label>Network goal<textarea rows={3} maxLength={500} disabled={!canEdit} value={goal} onChange={event => setGoal(event.target.value)} /></label>
@@ -185,10 +209,14 @@ function TaskEditor({ state, onSave }: {
       <label>Title<input maxLength={120} value={item.title} onChange={event => update(index, 'title', event.target.value)} /></label>
       <label>Goal<textarea rows={3} maxLength={500} value={item.goal} onChange={event => update(index, 'goal', event.target.value)} /></label>
       <label>Input<textarea rows={5} maxLength={8000} value={item.input} onChange={event => update(index, 'input', event.target.value)} /></label>
+      <div className="todo-editor"><span>Todos</span>{item.todos.map((todo, todoIndex) => <div className="todo-edit-row" key={todoIndex}>
+        <b>{todoIndex + 1}</b><input maxLength={200} value={todo} placeholder="Describe this step…" onChange={event => updateTodo(index, todoIndex, event.target.value)} />
+        <button type="button" aria-label={`Remove Todo ${todoIndex + 1}`} disabled={item.todos.length === 1} onClick={() => setWorkstreams(current => current.map((task, taskIndex) => taskIndex === index ? { ...task, todos: task.todos.filter((_, itemIndex) => itemIndex !== todoIndex) } : task))}>×</button>
+      </div>)}<button type="button" onClick={() => setWorkstreams(current => current.map((task, taskIndex) => taskIndex === index ? { ...task, todos: [...task.todos, ''] } : task))}>+ Add Todo</button></div>
       {index >= 2 && <button className="danger-link" type="button" onClick={() => setWorkstreams(current => current.filter((_, itemIndex) => itemIndex !== index))}>Remove task</button>}
     </fieldset>)}
     <button type="button" disabled={!canEdit || workstreams.length >= 10} onClick={() => setWorkstreams(current => [...current, {
-      id: `new-${Date.now()}`, title: '', goal: '', input: '',
+      id: `new-${Date.now()}`, title: '', goal: '', input: '', todos: [''],
     }])}>+ Add task</button>
     <button className="primary full" disabled={!canEdit || !valid || saving} onClick={async () => {
       setSaving(true);
@@ -199,7 +227,10 @@ function TaskEditor({ state, onSave }: {
 }
 
 function editableWorkstreams(state: CanvasState): EditableWorkstream[] {
-  return state.task.workstreams.map(({ id, title, goal, input }) => ({ id, title, goal, input }));
+  return state.task.workstreams.map(({ id, title, goal, input }) => ({
+    id, title, goal, input,
+    todos: state.task.todos.filter(todo => todo.workstream_id === id).sort((a, b) => a.step - b.step).map(todo => todo.title),
+  }));
 }
 
 function Timeline({ events, selection, onSelect }: { events: TeamEvent[]; selection: Selection; onSelect: (event: TeamEvent) => void }) {

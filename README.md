@@ -1,22 +1,55 @@
-# AgentNetwork - Jev as Router
+# JEV AgentNetwork
 
 https://github.com/user-attachments/assets/cf139790-4a4c-49d3-9909-50828d144e2e
 
-**A role-optional multi-agent network built to scale from two agents to thousands with one JEV router and general-purpose AI agents.**
+**An event-driven network of general-purpose AI agents, coordinated by JEV.**
 
 [中文](README.zh-CN.md)
 
-AgentRouter connects JEV to an agent team. It replaces complex routing models, fixed expert roles, and lead-agent hierarchies with one fast JEV router that reads live team state and sends each task to an available general-purpose agent.
+JEV AgentNetwork explores a multi-agent topology in which JEV observes live network state and assigns pending work to available agents. `AgentRouter` is the reference implementation in this repository: JEV makes the routing decisions, while general-purpose agents execute work concurrently.
 
-Agents work in parallel. Whenever one finishes, JEV can immediately find an idle agent and assign the next task without waiting for the rest of the team. Roles are optional prompt hints, not fixed job boundaries.
+The network is event-driven rather than round-based. Whenever an agent finishes, its completion event triggers a new routing decision immediately; the router does not wait for the rest of the team to reach a synchronization point. Agents are general-purpose by default, and roles are optional prompt hints rather than fixed capability boundaries.
 
-This repository demonstrates:
+## Network model
+
+The pattern has three defining properties:
+
+- **General-purpose nodes:** agents are interchangeable by default; optional roles can guide behavior without defining hard job boundaries.
+- **Event-driven routing:** every completion can immediately release and reassign capacity.
+- **State-aware scheduling:** the router sees pending work, recent results, and which agents are idle or busy.
+
+In this example, Agent A finishes first and starts Task 3 while Agent B is still working on Task 2:
+
+```mermaid
+sequenceDiagram
+    participant R as JEV Router
+    participant A as Agent A
+    participant B as Agent B
+
+    R->>A: Assign Task 1
+    activate A
+    R->>B: Assign Task 2
+    activate B
+    A-->>R: Task 1 completed
+    deactivate A
+    Note over R,B: Agent B continues working
+    R->>A: Assign Task 3 immediately
+    activate A
+    A-->>R: Task 3 completed
+    deactivate A
+    B-->>R: Task 2 completed
+    deactivate B
+```
+
+This repository focuses on the network topology and scheduling behavior. It is not intended to replace a general-purpose agent SDK or require every application to use multiple agents.
+
+The reference implementation demonstrates:
 
 - JEV-based multi-agent routing
 - parallel agent orchestration
 - role-free and role-optional agent teams
 - dynamic idle-agent selection
-- editable demo tasks and user-created workstreams
+- editable demo tasks, user-created workstreams, and user-defined Todo steps
 - human-in-the-loop workflows
 - OpenAI Responses API agents with real tools
 
@@ -64,6 +97,6 @@ For a remote or headless machine:
 ./start.sh --no-open --host 0.0.0.0
 ```
 
-AgentNetwork is an early research prototype. It ships with two editable demo tasks, supports user-created tasks, and runs with up to five agents. Keep API keys in environment variables; never commit them.
+JEV AgentNetwork is an early research prototype. It ships with two editable demo tasks, supports user-created tasks, and runs with up to five agents. Keep API keys in environment variables; never commit them.
 
 Apache-2.0 license.

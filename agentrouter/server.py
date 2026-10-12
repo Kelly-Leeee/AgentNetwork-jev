@@ -38,6 +38,7 @@ class WorkstreamUpdate(BaseModel):
     title: str
     goal: str
     input: str
+    todos: list[str]
 
 
 class TaskUpdate(BaseModel):

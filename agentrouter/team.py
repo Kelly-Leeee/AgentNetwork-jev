@@ -232,7 +232,7 @@ class TeamOrchestrator:
             return agent.public()
 
     def update_task(self, *, goal: str,
-                    workstreams: list[dict[str, str]]) -> dict[str, Any]:
+                    workstreams: list[dict[str, Any]]) -> dict[str, Any]:
         if self._run_lock.locked():
             raise RuntimeError("Cannot customize tasks while a step is running")
         with self._state_lock:
@@ -247,7 +247,6 @@ class TeamOrchestrator:
             if not DEMO_TASK_IDS.issubset(supplied_ids):
                 raise ValueError("the two demo tasks must be retained")
             current = {item["id"]: item for item in self.task["workstreams"]}
-            previous_todos = self.task["todos"]
             updated_workstreams: list[dict[str, Any]] = []
             updated_todos: list[dict[str, Any]] = []
             seen_ids: set[str] = set()
@@ -268,27 +267,22 @@ class TeamOrchestrator:
                     raise ValueError("task goal must be between 1 and 500 characters")
                 if not workstream_input or len(workstream_input) > 8000:
                     raise ValueError("task input must be between 1 and 8000 characters")
+                todo_titles = [str(item).strip() for item in update.get("todos", [])]
+                if not todo_titles or any(not item or len(item) > 200 for item in todo_titles):
+                    raise ValueError("each task needs at least one Todo of up to 200 characters")
                 owner = current.get(workstream_id, {}).get("owner") or agent_ids[index % len(agent_ids)]
                 updated_workstreams.append({
                     "id": workstream_id, "title": title, "goal": workstream_goal,
                     "input": workstream_input, "owner": owner, "status": "ready",
                     "final_output": "",
                 })
-                existing_todos = [item for item in previous_todos if item["workstream_id"] == workstream_id]
-                if existing_todos:
-                    updated_todos.extend(existing_todos)
-                else:
-                    for step, todo_title in enumerate((
-                        "Analyze the task and plan the work",
-                        "Produce a complete result",
-                        "Review and finalize the result",
-                    ), start=1):
-                        updated_todos.append({
-                            "id": f"{workstream_id}-{step}", "workstream_id": workstream_id,
-                            "step": step, "title": todo_title,
-                            "status": "assigned" if step == 1 else "pending",
-                            "owner": owner, "result": "", "agent_output": None,
-                        })
+                for step, todo_title in enumerate(todo_titles, start=1):
+                    updated_todos.append({
+                        "id": f"{workstream_id}-{step}", "workstream_id": workstream_id,
+                        "step": step, "title": todo_title,
+                        "status": "assigned" if step == 1 else "pending",
+                        "owner": owner, "result": "", "agent_output": None,
+                    })
             self.task["goal"] = goal
             self.task["workstreams"] = updated_workstreams
             self.task["todos"] = updated_todos

@@ -245,12 +245,14 @@ class TeamOrchestratorTests(unittest.TestCase):
             team = TeamOrchestrator(self.settings(root), root)
             workstreams = [
                 {"id": item["id"], "title": f"Custom {index}",
-                 "goal": f"Goal {index}", "input": f"Input {index}"}
+                 "goal": f"Goal {index}", "input": f"Input {index}",
+                 "todos": ["Research", "Write", "Verify", "Deliver"]}
                 for index, item in enumerate(team.task["workstreams"], start=1)
             ]
             workstreams.append({
                 "id": "new-client-id", "title": "New task",
                 "goal": "Complete a new task", "input": "New task context",
+                "todos": ["Only user-defined step"],
             })
             state = team.update_task(goal="Custom network goal", workstreams=workstreams)
             self.assertEqual(state["task"]["goal"], "Custom network goal")
@@ -260,7 +262,7 @@ class TeamOrchestratorTests(unittest.TestCase):
             self.assertTrue(custom["id"].startswith("custom-"))
             custom_todos = [item for item in state["task"]["todos"]
                             if item["workstream_id"] == custom["id"]]
-            self.assertEqual([item["step"] for item in custom_todos], [1, 2, 3])
+            self.assertEqual([item["title"] for item in custom_todos], ["Only user-defined step"])
 
             team._agents["agent-1"].runs.append({"id": "run-1"})
             with self.assertRaisesRegex(RuntimeError, "Reset the demo"):
