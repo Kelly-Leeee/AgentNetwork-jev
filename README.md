@@ -1,8 +1,8 @@
-# Jev - AgentRouter
+# AgentNetwork - Jev as Router
 
 https://github.com/user-attachments/assets/cf139790-4a4c-49d3-9909-50828d144e2e
 
-**A simple, role-optional multi-agent router: one JEV router + general-purpose AI agents.**
+**A role-optional multi-agent network built to scale from two agents to thousands with one JEV router and general-purpose AI agents.**
 
 [中文](README.zh-CN.md)
 
