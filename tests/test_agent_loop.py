@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,6 +45,13 @@ class FakeStream:
 
 
 class AgentLoopTests(unittest.TestCase):
+    def test_jev_settings_can_be_overridden_by_environment(self) -> None:
+        settings_path = Path(__file__).resolve().parents[1] / "settings.example.json"
+        with patch.dict(os.environ, {"JEV_API_KEY": "env-key", "JEV_MODEL": "env-model"}):
+            settings = load_settings(settings_path)
+        self.assertEqual(settings.jev.api_key, "env-key")
+        self.assertEqual(settings.jev.model, "env-model")
+
     def test_settings_use_central_system_prompt_by_default(self) -> None:
         settings = load_settings(Path(__file__).resolve().parents[1] / "settings.json")
         self.assertEqual(settings.agent.system_prompt, SYSTEM_PROMPT)

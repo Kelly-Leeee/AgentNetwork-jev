@@ -77,8 +77,8 @@ def load_settings(path: str | Path = "settings.json") -> Settings:
         timeout_seconds=float(openai_raw.get("timeout_seconds", 60.0)),
     )
     jev_settings = JevSettings(
-        api_key=str(jev_raw.get("api_key", "")).strip(),
-        model=str(jev_raw.get("model", "jev-latest")).strip(),
+        api_key=os.getenv("JEV_API_KEY", str(jev_raw.get("api_key", ""))).strip(),
+        model=os.getenv("JEV_MODEL", str(jev_raw.get("model", "jev-latest"))).strip(),
     )
     agent_settings = AgentSettings(
         workspace=workspace,

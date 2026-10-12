@@ -10,7 +10,7 @@ __pycache__/
 .Python
 build/
 develop-eggs/
-dist/
+/dist/
 downloads/
 eggs/
 .eggs/
@@ -229,4 +229,5 @@ chats/
 
 # Agent canvas frontend
 frontend/node_modules/
-agentrouter/web/dist/
+!agentrouter/web/dist/
+!agentrouter/web/dist/**

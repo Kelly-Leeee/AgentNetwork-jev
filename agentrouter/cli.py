@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,14 @@ from openai import OpenAI
 from .agent import Agent
 from .config import load_settings
 from .tools import WorkspaceTools
+
+
+def default_settings_path() -> str:
+    """Prefer a user's local config while keeping a clone runnable from env vars."""
+    configured = os.getenv("AGENTROUTER_SETTINGS")
+    if configured:
+        return configured
+    return "settings.json" if Path("settings.json").is_file() else "settings.example.json"
 
 
 def _event_printer(kind: str, payload: dict[str, Any], *, verbose: bool) -> None:
@@ -58,9 +67,10 @@ def build_loop(settings_path: str, verbose: bool):
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a real OpenAI tool-calling agent loop.")
     parser.add_argument("prompt", nargs="*", help="Task; omit for interactive mode")
-    parser.add_argument("--settings", default="settings.json")
+    parser.add_argument("--settings", default=default_settings_path())
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--canvas", action="store_true", help="Launch the local Agent Team Canvas")
+    parser.add_argument("--no-open", action="store_true", help="Do not open the Canvas in a browser")
     parser.add_argument("--host", default="127.0.0.1", help="Canvas bind address")
     parser.add_argument("--port", type=int, default=8765, help="Canvas port")
     args = parser.parse_args(argv)
@@ -68,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.canvas:
             from .server import run_server
 
-            run_server(args.settings, args.host, args.port)
+            run_server(args.settings, args.host, args.port, open_browser=not args.no_open)
             return 0
         agent = build_agent(args.settings, args.verbose)
         if args.prompt:

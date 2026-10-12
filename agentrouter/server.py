@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import queue
+import threading
+import webbrowser
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -119,7 +121,11 @@ def create_app(settings_path: str | Path = "settings.json") -> FastAPI:
     return app
 
 
-def run_server(settings_path: str, host: str, port: int) -> None:
+def run_server(settings_path: str, host: str, port: int, *, open_browser: bool = True) -> None:
     import uvicorn
 
+    if open_browser:
+        browser_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+        url = f"http://{browser_host}:{port}"
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     uvicorn.run(create_app(settings_path), host=host, port=port)
