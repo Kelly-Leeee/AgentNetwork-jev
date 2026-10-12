@@ -1,4 +1,6 @@
-# AgentRouter
+# Jev - AgentRouter
+
+[▶ Watch the demo video](demo-video.mov)
 
 **A simple, role-optional multi-agent router: one JEV router + general-purpose AI agents.**
 
