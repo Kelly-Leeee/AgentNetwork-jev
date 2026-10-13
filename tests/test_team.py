@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import unittest
@@ -267,6 +268,60 @@ class TeamOrchestratorTests(unittest.TestCase):
             team._agents["agent-1"].runs.append({"id": "run-1"})
             with self.assertRaisesRegex(RuntimeError, "Reset the demo"):
                 team.update_task(goal="Another goal", workstreams=workstreams)
+
+    def test_task_context_is_restored_from_local_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            team = TeamOrchestrator(self.settings(root), root)
+            workstreams = [{
+                "id": item["id"], "title": item["title"], "goal": item["goal"],
+                "input": f"Persisted input {index}", "todos": ["Persisted step"],
+            } for index, item in enumerate(team.task["workstreams"], start=1)]
+            team.update_task(goal="Persisted network goal", workstreams=workstreams)
+
+            restored = TeamOrchestrator(self.settings(root), root)
+
+            self.assertEqual(restored.task["goal"], "Persisted network goal")
+            self.assertEqual(restored.task["workstreams"][0]["input"], "Persisted input 1")
+            task_files = sorted((root / "tasks").glob("*.json"))
+            self.assertEqual([item.name for item in task_files], [
+                "meeting-reschedule.json", "support-recovery.json",
+            ])
+            saved = json.loads((root / "tasks" / "support-recovery.json").read_text(encoding="utf-8"))
+            self.assertNotIn("events", saved)
+            self.assertIn("agent_configs", saved)
+            self.assertNotIn("agents", saved)
+            self.assertTrue(all("runs" not in item for item in saved["agent_configs"]))
+            self.assertEqual(saved["messages"][-1]["role"], "user")
+            self.assertEqual(saved["messages"][-1]["type"], "task_customized")
+            self.assertIn("Persisted network goal", saved["messages"][-1]["content"])
+
+    def test_agent_runtime_is_reset_before_each_task_scoped_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            team = TeamOrchestrator(self.settings(root), root)
+            agent = team._agents["agent-1"]
+            reset_calls = []
+            agent.runtime.reset = lambda: reset_calls.append(True)
+            agent.runtime.prompt = lambda _text: SimpleNamespace(
+                output='{"artifact":"done","unresolved":[]}',
+                model_call_count=1,
+                tool_call_count=0,
+            )
+
+            team._run_one_todo(team.task["todos"][0])
+
+            self.assertEqual(reset_calls, [True])
+            saved = json.loads(
+                (root / "tasks" / "support-recovery.json").read_text(encoding="utf-8")
+            )
+            completed = next(item for item in saved["messages"]
+                             if item["type"] == "agent_completed")
+            self.assertIn("run_id", completed["metadata"]["payload"])
+
+            restored = TeamOrchestrator(self.settings(root), root)
+            self.assertEqual(len(restored._agents["agent-1"].runs), 1)
+            self.assertEqual(restored._agents["agent-1"].runs[0]["status"], "completed")
 
     def test_name_edit_rebuilds_runtime_and_keeps_agent_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

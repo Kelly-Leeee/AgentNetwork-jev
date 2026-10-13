@@ -91,13 +91,20 @@ class TeamOrchestrator:
         self.settings = settings
         self.project_root = project_root.resolve()
         self.chats_dir = self.project_root / "chats"
+        self.tasks_dir = self.project_root / "tasks"
+        self.legacy_task_file = self.tasks_dir / "parallel-demo-001" / "task.json"
         self.events = EventHub()
         self._state_lock = threading.RLock()
         self._run_lock = threading.Lock()
         self._agents: dict[str, TeamAgent] = {}
         self._event_log: list[dict[str, Any]] = []
+        self._messages: list[dict[str, Any]] = []
         self._paused = False
+        self._restoring = True
         self._build_initial_state()
+        self._restore_task_state()
+        self._restoring = False
+        self._persist_task_state()
 
     def _build_initial_state(self) -> None:
         self.task: dict[str, Any] = {
@@ -163,6 +170,7 @@ class TeamOrchestrator:
             agent_id, name = agent_spec(index)
             self._agents[agent_id] = self._make_agent(agent_id, name)
         self._event_log.clear()
+        self._messages.clear()
         self._emit("task_ready", "system", {"message": "Demo task is ready"})
 
     def _make_agent(self, agent_id: str, name: str, role: str = "") -> TeamAgent:
@@ -205,7 +213,9 @@ class TeamOrchestrator:
             max_output_tokens=self.settings.agent.max_output_tokens,
             streaming=False,
             agent_id=agent_id,
-            chats_dir=self.chats_dir,
+            # Team agents are stateless workers. Durable context belongs to the task;
+            # their per-run process and output remain available as audit records.
+            chats_dir=None,
             on_event=lambda kind, payload, aid=agent_id: self._agent_event(aid, kind, payload),
         )
         return TeamAgent(agent_id, name, runtime, role=role)
@@ -289,7 +299,11 @@ class TeamOrchestrator:
             self.task["transcript"] = next(
                 item["input"] for item in updated_workstreams if item["id"] == "support-recovery"
             )
-            self._emit("task_customized", "user", {"workstream_ids": list(seen_ids)})
+            self._emit("task_customized", "user", {
+                "goal": goal,
+                "workstreams": deepcopy(updated_workstreams),
+                "todos": deepcopy(updated_todos),
+            })
             return self.snapshot()
 
     def update_agent(self, agent_id: str, *, name: str,
@@ -486,7 +500,6 @@ class TeamOrchestrator:
             workstream["status"] = "running"
             agent.status = "running"
             agent.current_todo_id = todo["id"]
-            self._emit("agent_started", agent.id, {"todo_id": todo["id"], "title": todo["title"]})
             assignment = self._assignment_prompt(agent, todo)
             run_record = {
                 "id": uuid4().hex,
@@ -502,8 +515,16 @@ class TeamOrchestrator:
                 "tool_calls": 0,
             }
             agent.runs.append(run_record)
+            self._emit("agent_started", agent.id, {
+                "run_id": run_record["id"], "todo_id": todo["id"],
+                "workstream_id": todo["workstream_id"],
+                "title": todo["title"], "input": assignment,
+            })
 
         try:
+            # Never carry an agent's previous assignment conversation into this run.
+            # The assignment prompt below is rebuilt from the authoritative workstream state.
+            agent.runtime.reset()
             result = agent.runtime.prompt(assignment)
         except Exception:
             with self._state_lock:
@@ -529,10 +550,17 @@ class TeamOrchestrator:
             todo["status"] = "completed"
             todo["result"] = canonical_output
             todo["agent_output"] = agent_output
+            # Keep the provider-native response items with the readable assistant message.
+            # This preserves tool/model details without making them the task's state model.
             self._emit("agent_completed", agent.id, {
-                "todo_id": todo["id"], "output": canonical_output,
+                "run_id": run_record["id"], "todo_id": todo["id"],
+                "workstream_id": todo["workstream_id"], "output": canonical_output,
                 "model_calls": result.model_call_count, "tool_calls": result.tool_call_count,
             })
+            response_items = getattr(result, "response_items", None)
+            if isinstance(response_items, list) and self._messages:
+                self._messages[-1]["openai_items"] = response_items
+                self._persist_task_state()
             workstream["status"] = "ready"
 
     def _route_completed_workstream(self, workstream_id: str) -> None:
@@ -908,12 +936,17 @@ class TeamOrchestrator:
                      for item in self.task["todos"]
                      if item["workstream_id"] == workstream["id"]
                      and item["status"] == "completed"]
+        human_context = [{"question": item["question"], "answer": item["answer"]}
+                         for item in self.task["human_interactions"]
+                         if item.get("workstream_id") == workstream["id"]]
         return (
+            f"Overall task goal:\n{self.task['goal']}\n\n"
             f"Workstream:\n{workstream['title']}\n\n"
             f"Workstream goal:\n{workstream['goal']}\n\n"
             f"Workstream input:\n{workstream['input']}\n\n"
             f"Your assigned todo:\n{todo['title']}\n\n"
             f"Previous completed work:\n{json.dumps(completed, ensure_ascii=False)}\n\n"
+            f"Relevant human context:\n{json.dumps(human_context, ensure_ascii=False)}\n\n"
             "Return exactly one valid JSON object with only these two top-level keys:\n"
             "{\"artifact\": <the completed work>, \"unresolved\": [<remaining issue>, ...]}\n"
             "The artifact may be a string, object, or array and must contain the actual completed "
@@ -1009,6 +1042,7 @@ class TeamOrchestrator:
                 agent = self._agents.get(agent_id)
                 active_run = agent.runs[-1] if agent and agent.runs and agent.runs[-1]["status"] == "running" else None
                 if active_run is not None:
+                    safe["run_id"] = active_run["id"]
                     active_run["process"].append({
                         "type": kind,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1028,7 +1062,290 @@ class TeamOrchestrator:
             self._event_log.append(event)
             if len(self._event_log) > 200:
                 del self._event_log[:-200]
+            self._messages.append(self._event_message(event))
+            if not self._restoring:
+                self._persist_task_state()
         self.events.publish(event)
+
+    @staticmethod
+    def _event_message(event: dict[str, Any]) -> dict[str, Any]:
+        """Represent orchestration activity as one chronological, OpenAI-style message."""
+        event_type = event["type"]
+        payload = event["payload"]
+        if event_type in {"task_customized", "human_answered", "agent_started"}:
+            role = "user"
+        elif event_type in {"model_request", "tool_start", "tool_end", "stream_end"}:
+            role = "tool"
+        elif event["actor_id"] == "system":
+            role = "system"
+        else:
+            role = "assistant"
+        preferred_key = {
+            "task_ready": "message",
+            "agent_started": "input",
+            "agent_completed": "output",
+            "human_question": "question",
+            "human_answered": "answer",
+            "task_completed": "final_output",
+            "workstream_completed": "final_output",
+        }.get(event_type)
+        content = payload.get(preferred_key) if preferred_key else None
+        if not isinstance(content, str):
+            content = json.dumps(payload, ensure_ascii=False)
+        message = {
+            "role": role,
+            "content": content,
+            "timestamp": event["timestamp"],
+            "actor_id": event["actor_id"],
+            "type": event_type,
+            "event_id": event["id"],
+            "metadata": {"payload": payload},
+        }
+        if event_type == "agent_completed" and isinstance(payload.get("openai_items"), list):
+            message["openai_items"] = payload["openai_items"]
+        return message
+
+    def _persist_task_state(self) -> None:
+        """Persist one self-contained JSON document per user-visible Task."""
+        if self._restoring:
+            return
+        self.tasks_dir.mkdir(parents=True, exist_ok=True)
+        network_state = deepcopy(self.task)
+        for key in ("workstreams", "todos", "transcript", "human_interactions",
+                    "route_history", "pending_human_question", "pending_human_questions"):
+            network_state.pop(key, None)
+        for workstream_index, workstream in enumerate(self.task["workstreams"]):
+            workstream_id = workstream["id"]
+            todos = [deepcopy(item) for item in self.task["todos"]
+                     if item["workstream_id"] == workstream_id]
+            messages = self._messages_for_workstream(workstream_id)
+            involved_agents = {
+                item.get("owner") for item in todos if item.get("owner")
+            } | {
+                item.get("actor_id") for item in messages
+                if str(item.get("actor_id", "")).startswith("agent-")
+            }
+            task_record = deepcopy(workstream)
+            task_record.update({
+                "network_id": self.task["id"],
+                "network_goal": self.task["goal"],
+                "network_index": workstream_index,
+                "todos": todos,
+                "human_interactions": [deepcopy(item) for item in self.task["human_interactions"]
+                                       if item.get("workstream_id") == workstream_id],
+                "route_history": [deepcopy(item) for item in self.task["route_history"]
+                                  if item.get("workstream_id") == workstream_id],
+                "pending_human_question": deepcopy(self.task["pending_human_question"])
+                if (self.task.get("pending_human_question") or {}).get("workstream_id") == workstream_id
+                else None,
+                "pending_human_questions": [deepcopy(item)
+                                            for item in self.task["pending_human_questions"]
+                                            if item.get("workstream_id") == workstream_id],
+            })
+            payload = {
+                "version": 2,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "task": task_record,
+                "network_state": network_state,
+                "agent_configs": [{
+                    "id": agent.id, "name": agent.name, "role": agent.role,
+                } for agent in self._agents.values() if agent.id in involved_agents],
+                "messages": messages,
+                "paused": self._paused,
+            }
+            path = self.tasks_dir / f"{workstream_id}.json"
+            temporary = path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(path)
+        if self.legacy_task_file.is_file():
+            self.legacy_task_file.unlink()
+            try:
+                self.legacy_task_file.parent.rmdir()
+            except OSError:
+                pass
+
+    def _messages_for_workstream(self, workstream_id: str) -> list[dict[str, Any]]:
+        todo_ids = {item["id"] for item in self.task["todos"]
+                    if item["workstream_id"] == workstream_id}
+        run_ids: set[str] = set()
+        selected: list[dict[str, Any]] = []
+        for message in self._messages:
+            payload = message.get("metadata", {}).get("payload", {})
+            if payload.get("workstream_id") == workstream_id or payload.get("todo_id") in todo_ids:
+                if isinstance(payload.get("run_id"), str):
+                    run_ids.add(payload["run_id"])
+        for message in self._messages:
+            payload = message.get("metadata", {}).get("payload", {})
+            include = (
+                payload.get("workstream_id") == workstream_id
+                or payload.get("todo_id") in todo_ids
+                or payload.get("run_id") in run_ids
+                or message.get("type") in {"task_ready", "task_completed", "task_paused",
+                                           "task_resumed", "execution_mode_changed"}
+            )
+            if message.get("type") == "task_customized":
+                workstream = next(item for item in self.task["workstreams"]
+                                  if item["id"] == workstream_id)
+                tailored = deepcopy(message)
+                tailored_payload = {
+                    "network_goal": self.task["goal"],
+                    "workstream": deepcopy(workstream),
+                    "todos": [deepcopy(item) for item in self.task["todos"]
+                              if item["workstream_id"] == workstream_id],
+                    "workstream_id": workstream_id,
+                }
+                tailored["content"] = json.dumps(tailored_payload, ensure_ascii=False)
+                tailored["metadata"] = {"payload": tailored_payload}
+                selected.append(tailored)
+            elif include:
+                selected.append(deepcopy(message))
+        return selected
+
+    def _restore_task_state(self) -> None:
+        """Restore per-Task files, with one-time support for the legacy parent snapshot."""
+        paths = sorted(self.tasks_dir.glob("*.json")) if self.tasks_dir.is_dir() else []
+        if not paths and self.legacy_task_file.is_file():
+            try:
+                saved = json.loads(self.legacy_task_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return
+            task = saved.get("task")
+            if not isinstance(task, dict) or not isinstance(task.get("workstreams"), list):
+                return
+            self.task = task
+            self._messages = saved.get("messages") if isinstance(saved.get("messages"), list) else []
+            agents = saved.get("agent_configs", saved.get("agents", []))
+            paused = bool(saved.get("paused", False))
+        elif paths:
+            documents = []
+            for path in paths:
+                try:
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if isinstance(value.get("task"), dict):
+                    documents.append(value)
+            if not documents:
+                return
+            documents.sort(key=lambda item: item["task"].get("network_index", 0))
+            network = deepcopy(documents[0].get("network_state", {}))
+            network.setdefault("id", documents[0]["task"].get("network_id", "parallel-demo-001"))
+            network.setdefault("goal", documents[0]["task"].get("network_goal", ""))
+            network["workstreams"], network["todos"] = [], []
+            network["human_interactions"], network["route_history"] = [], []
+            pending, queued = None, []
+            agent_map: dict[str, dict[str, Any]] = {}
+            message_map: dict[tuple[str, str], dict[str, Any]] = {}
+            for document in documents:
+                record = deepcopy(document["task"])
+                todos = record.pop("todos", [])
+                network["human_interactions"].extend(record.pop("human_interactions", []))
+                network["route_history"].extend(record.pop("route_history", []))
+                candidate = record.pop("pending_human_question", None)
+                if candidate and pending is None:
+                    pending = candidate
+                queued.extend(record.pop("pending_human_questions", []))
+                record.pop("network_id", None)
+                record.pop("network_goal", None)
+                record.pop("network_index", None)
+                network["workstreams"].append(record)
+                network["todos"].extend(todos)
+                for item in document.get("agent_configs", []):
+                    if isinstance(item, dict) and item.get("id"):
+                        agent_map[item["id"]] = item
+                for message in document.get("messages", []):
+                    if isinstance(message, dict):
+                        payload = message.get("metadata", {}).get("payload", {})
+                        key = (str(message.get("event_id", "")), str(payload.get("workstream_id", "")))
+                        message_map[key] = message
+            network["pending_human_question"] = pending
+            network["pending_human_questions"] = queued
+            network["transcript"] = next((item.get("input", "") for item in network["workstreams"]
+                                          if item.get("id") == "support-recovery"), "")
+            self.task = network
+            self._messages = sorted(message_map.values(), key=lambda item: item.get("timestamp", ""))
+            agents = list(agent_map.values())
+            paused = any(bool(item.get("paused")) for item in documents)
+        else:
+            return
+        self.task["routing_count"] = 0
+        if self.task.get("status") == "running":
+            self.task["status"] = "ready"
+        for todo in self.task.get("todos", []):
+            if todo.get("status") == "running":
+                todo["status"] = "assigned"
+        for workstream in self.task.get("workstreams", []):
+            if workstream.get("status") in {"running", "routing"}:
+                workstream["status"] = "ready"
+        self._agents.clear()
+        for item in agents[:MAX_AGENTS]:
+            agent_id = str(item.get("id", ""))
+            if not agent_id:
+                continue
+            agent = self._make_agent(
+                agent_id,
+                str(item.get("name") or agent_id),
+                str(item.get("role") or ""),
+            )
+            agent.runs = self._runs_from_messages(agent_id)
+            agent.last_output = agent.runs[-1]["output"] if agent.runs else ""
+            agent.status = "assigned" if any(
+                todo.get("status") == "assigned" and todo.get("owner") == agent_id
+                for todo in self.task.get("todos", [])
+            ) else "idle"
+            self._agents[agent_id] = agent
+        # Rebuild the UI projection from the single durable message timeline.
+        self._event_log = [{
+            "id": item.get("event_id", uuid4().hex),
+            "type": item.get("type", "message"),
+            "actor_id": item.get("actor_id", item.get("role", "system")),
+            "payload": item.get("metadata", {}).get("payload", {"content": item.get("content", "")}),
+            "timestamp": item.get("timestamp", datetime.now(timezone.utc).isoformat()),
+        } for item in self._messages[-200:] if isinstance(item, dict)]
+        self._paused = paused
+
+    def _runs_from_messages(self, agent_id: str) -> list[dict[str, Any]]:
+        """Project persisted messages into the run shape used by the Canvas inspector."""
+        runs: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for message in self._messages:
+            if not isinstance(message, dict) or message.get("actor_id") != agent_id:
+                continue
+            payload = message.get("metadata", {}).get("payload", {})
+            run_id = payload.get("run_id") if isinstance(payload, dict) else None
+            if not isinstance(run_id, str):
+                continue
+            event_type = message.get("type")
+            if event_type == "agent_started":
+                runs[run_id] = {
+                    "id": run_id,
+                    "todo_id": payload.get("todo_id", ""),
+                    "todo_title": payload.get("title", ""),
+                    "input": payload.get("input", message.get("content", "")),
+                    "process": [],
+                    "output": "",
+                    "status": "running",
+                    "started_at": message.get("timestamp"),
+                    "completed_at": None,
+                    "model_calls": 0,
+                    "tool_calls": 0,
+                }
+                order.append(run_id)
+            elif event_type in {"model_request", "tool_start", "tool_end", "stream_end"}:
+                if run_id in runs:
+                    runs[run_id]["process"].append({
+                        "type": event_type,
+                        "timestamp": message.get("timestamp"),
+                        "payload": payload,
+                    })
+            elif event_type == "agent_completed" and run_id in runs:
+                run = runs[run_id]
+                run["output"] = payload.get("output", message.get("content", ""))
+                run["status"] = "completed"
+                run["completed_at"] = message.get("timestamp")
+                run["model_calls"] = payload.get("model_calls", 0)
+                run["tool_calls"] = payload.get("tool_calls", 0)
+        return [runs[run_id] for run_id in order]
 
     def _require_agent(self, agent_id: str) -> TeamAgent:
         try:

@@ -185,6 +185,9 @@ function TaskEditor({ state, onSave }: {
   const [goal, setGoal] = useState(state.task.goal);
   const [workstreams, setWorkstreams] = useState<EditableWorkstream[]>(() => editableWorkstreams(state));
   const [saving, setSaving] = useState(false);
+  const [uploading, setUploading] = useState<number | null>(null);
+  const [uploadError, setUploadError] = useState('');
+  const [uploadedFiles, setUploadedFiles] = useState<Record<number, string>>({});
 
   useEffect(() => {
     setGoal(state.task.goal);
@@ -209,6 +212,26 @@ function TaskEditor({ state, onSave }: {
       <label>Title<input maxLength={120} value={item.title} onChange={event => update(index, 'title', event.target.value)} /></label>
       <label>Goal<textarea rows={3} maxLength={500} value={item.goal} onChange={event => update(index, 'goal', event.target.value)} /></label>
       <label>Input<textarea rows={5} maxLength={8000} value={item.input} onChange={event => update(index, 'input', event.target.value)} /></label>
+      <div className="file-upload">
+        <input id={`task-input-file-${index}`} className="file-input-hidden" type="file" accept=".txt,.doc,.docx,text/plain,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document" disabled={!canEdit || uploading !== null} onChange={async event => {
+          const file = event.target.files?.[0];
+          event.target.value = '';
+          if (!file) return;
+          setUploading(index);
+          setUploadError('');
+          try {
+            const parsed = await api.parseTaskInputFile(file);
+            if (parsed.text.length > 8000) throw new Error('Parsed text is longer than the 8,000-character task input limit.');
+            update(index, 'input', parsed.text);
+            setUploadedFiles(current => ({ ...current, [index]: parsed.filename }));
+          } catch (cause) { setUploadError(messageOf(cause)); }
+          finally { setUploading(null); }
+        }} />
+        <label className="file-upload-button" htmlFor={`task-input-file-${index}`}>
+          {uploading === index ? 'Parsing file…' : 'Upload TXT / Word'}
+        </label>
+        <span>{uploadedFiles[index] ? `Loaded: ${uploadedFiles[index]}` : 'Supports .txt, .doc and .docx. Parsed text replaces Input.'}</span>
+      </div>
       <div className="todo-editor"><span>Todos</span>{item.todos.map((todo, todoIndex) => <div className="todo-edit-row" key={todoIndex}>
         <b>{todoIndex + 1}</b><input maxLength={200} value={todo} placeholder="Describe this step…" onChange={event => updateTodo(index, todoIndex, event.target.value)} />
         <button type="button" aria-label={`Remove Todo ${todoIndex + 1}`} disabled={item.todos.length === 1} onClick={() => setWorkstreams(current => current.map((task, taskIndex) => taskIndex === index ? { ...task, todos: task.todos.filter((_, itemIndex) => itemIndex !== todoIndex) } : task))}>×</button>
@@ -222,6 +245,7 @@ function TaskEditor({ state, onSave }: {
       setSaving(true);
       try { await onSave(goal, workstreams); } finally { setSaving(false); }
     }}>{saving ? 'Saving…' : 'Save tasks'}</button>
+    {uploadError && <p className="upload-error" role="alert">{uploadError}</p>}
     {!canEdit && <p className="muted">Reset the demo to customize tasks after execution has started.</p>}
   </div>;
 }

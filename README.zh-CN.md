@@ -51,6 +51,11 @@ sequenceDiagram
 - human-in-the-loop workflow
 - 使用真实工具的 OpenAI Responses API agent
 
+Task 与 workstream context 是持久化的权威数据源。每次 agent run 只接收当前 workstream
+的输入、当前 Todo、已完成的结构化产出和相关用户回答，不继承该 agent 在其他任务中的对话。
+本地任务状态和完整的 OpenAI-style `messages` 时间线统一保存在
+`tasks/<task-id>.json`，Canvas 重启后会自动恢复。
+
 ## Quickstart
 
 需要 Python 3.10+、OpenAI-compatible API key 和 JEV API key。不需要 Node.js。

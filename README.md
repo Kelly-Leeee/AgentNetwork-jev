@@ -53,6 +53,12 @@ The reference implementation demonstrates:
 - human-in-the-loop workflows
 - OpenAI Responses API agents with real tools
 
+Task and workstream context is the durable source of truth. Each agent run receives the current
+workstream input, assigned Todo, completed structured outputs, and relevant human answers; it does
+not inherit that agent's conversations from unrelated assignments. Local task state and audit
+history is stored as one chronological, OpenAI-style `messages` stream inside
+`tasks/<task-id>.json` and restored when the canvas restarts.
+
 ## Quickstart
 
 Requirements: Python 3.10+, an OpenAI-compatible API key, and a JEV API key.

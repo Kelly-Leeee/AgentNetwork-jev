@@ -23,6 +23,16 @@ export const api = {
   updateTask: (goal: string, workstreams: Array<Pick<Workstream, 'id' | 'title' | 'goal' | 'input'> & { todos: string[] }>) => request<CanvasState>('/api/task', {
     method: 'PATCH', body: JSON.stringify({ goal, workstreams }),
   }),
+  parseTaskInputFile: async (file: File) => {
+    const response = await fetch('/api/task-input-file', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(file.name) },
+      body: file,
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.detail ?? `Upload failed: ${response.status}`);
+    return body as { filename: string; text: string };
+  },
   answerHuman: (answer: string) => request<CanvasState>('/api/human-answer', {
     method: 'POST', body: JSON.stringify({ answer }),
   }),

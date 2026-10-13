@@ -223,9 +223,13 @@ __marimo__/
 # AgentRouter local settings
 settings.json
 settings.local.json
+.DS_Store
 
-# Local agent conversation history
+# Legacy local agent conversation history
 chats/
+
+# Local task context and audit history
+tasks/
 
 # Agent canvas frontend
 frontend/node_modules/
