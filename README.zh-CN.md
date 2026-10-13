@@ -69,6 +69,8 @@ cd agentrouter
 
 ### 2. 配置 API key
 
+需要申请 API Token？前往 [TokenLab](https://tokenlab.one/)，联系我可享折扣。
+
 ```bash
 export OPENAI_API_KEY="你的-openai-key"
 export JEV_API_KEY="你的-jev-key"

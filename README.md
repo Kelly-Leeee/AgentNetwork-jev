@@ -72,6 +72,8 @@ cd AgentNetwork-jev
 
 ### 2. Add API keys
 
+Need an API token? Apply at [TokenLab](https://tokenlab.one/). Contact me for a discount.
+
 ```bash
 export OPENAI_API_KEY="your-openai-key"
 export JEV_API_KEY="your-jev-key"
